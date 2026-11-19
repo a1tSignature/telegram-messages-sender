@@ -139,6 +139,9 @@ func (c *Connection) recoveredMessage(ctx context.Context, ref domain.RecoveryRe
 		response, err = c.api.ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{
 			Channel: &tg.InputChannel{ChannelID: peer.ChannelID, AccessHash: peer.AccessHash}, ID: ids,
 		})
+		if ctx.Err() == nil && tgerr.Is(err, "CHANNEL_PRIVATE") {
+			return time.Time{}, nil
+		}
 	default:
 		return time.Time{}, nil
 	}

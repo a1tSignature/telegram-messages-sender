@@ -139,6 +139,32 @@ func (f *recoveringFixture) Recover(ctx context.Context, previous domain.UpdateC
 	return domain.RecoveryBatch{Checkpoint: next}, nil
 }
 
+func TestRecoveryHonorsPersistedAccountWaitAfterRestart(t *testing.T) {
+	f := newDeliveryFixture(t)
+	ctx := t.Context()
+	if _, err := f.state.BindAccount(ctx, recoveryAccount); err != nil {
+		t.Fatal(err)
+	}
+	until := f.time.Add(time.Minute)
+	if err := f.state.SetDeliveryWait(ctx, "", until); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := store.Open(ctx, f.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	engine := newEngine(reopened, func() time.Time { return f.time }, nil)
+	transport := &recoveringFixture{batches: make(chan domain.UpdateCheckpoint, 2)}
+	if retry, err := engine.reconcile(ctx, transport, recoveryAccount); err != nil || !retry.Equal(until) || len(transport.batches) != 0 {
+		t.Fatalf("recovery during persisted wait: retry=%v, calls=%d, err=%v", retry, len(transport.batches), err)
+	}
+	f.time = until
+	if retry, err := engine.reconcile(ctx, transport, recoveryAccount); err != nil || !retry.IsZero() || len(transport.batches) != 1 {
+		t.Fatalf("recovery after wait: retry=%v, calls=%d, err=%v", retry, len(transport.batches), err)
+	}
+}
+
 func TestStartupWakeAndReconnectPreserveControlsAndCadence(t *testing.T) {
 	f := newDeliveryFixture(t)
 	f.save(t, "a", firstChat, "group:17")
@@ -161,10 +187,8 @@ func TestStartupWakeAndReconnectPreserveControlsAndCadence(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	for chat, until := range map[domain.ChatID]time.Time{"": f.time.Add(30 * time.Second), firstChat: f.time.Add(5*time.Minute + time.Second)} {
-		if err := f.state.SetDeliveryWait(t.Context(), chat, until); err != nil {
-			t.Fatal(err)
-		}
+	if err := f.state.SetDeliveryWait(t.Context(), firstChat, f.time.Add(5*time.Minute+time.Second)); err != nil {
+		t.Fatal(err)
 	}
 
 	var clock atomic.Int64

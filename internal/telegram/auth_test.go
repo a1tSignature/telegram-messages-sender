@@ -388,6 +388,28 @@ func TestDedicatedSessionOverLocalMTProto(t *testing.T) {
 	}); err != nil || logins.Load() != before {
 		t.Fatalf("did not reuse the recovered session for the bound account: %v", err)
 	}
+
+	corrupt := []byte("invalid session")
+	if err := storage.StoreSession(ctx, corrupt); err != nil {
+		t.Fatal(err)
+	}
+	if err := newClient().Run(ctx, check); !errors.Is(err, keychain.ErrInvalid) || logins.Load() != before {
+		t.Fatalf("passive startup did not reject a malformed session: %v", err)
+	}
+	loginAccount.Store(expectedID)
+	if id, err := newClient().SignIn(ctx, prompts); !errors.Is(err, ErrAccountMismatch) || id != 0 {
+		t.Fatalf("repair accepted an unbound account: account=%d, err=%v", id, err)
+	}
+	if data, err := storage.LoadSession(ctx); err != nil || !bytes.Equal(data, corrupt) {
+		t.Fatalf("rejected repair replaced the saved session: %v", err)
+	}
+	loginAccount.Store(boundID)
+	if id, err := newClient().SignIn(ctx, prompts); err != nil || id != boundID {
+		t.Fatalf("repair did not restore the bound account: account=%d, err=%v", id, err)
+	}
+	if err := newClient().Run(ctx, func(context.Context, *Connection) error { return nil }); err != nil {
+		t.Fatalf("did not reuse the repaired session: %v", err)
+	}
 }
 
 type stagingWaitContext struct {

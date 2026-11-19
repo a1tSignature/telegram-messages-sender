@@ -8,6 +8,7 @@ import (
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 
 	"telegram-messages-sender/internal/content"
 	"telegram-messages-sender/internal/domain"
@@ -86,6 +87,8 @@ func TestSavedSourceRejectsForeignAndUnsupportedResponses(t *testing.T) {
 	}{
 		{"explicitly missing", &tg.MessagesMessages{Messages: []tg.MessageClass{&tg.MessageEmpty{ID: 81}}}, nil, content.ErrSourceDeleted},
 		{"empty complete response", &tg.MessagesMessages{}, nil, content.ErrSourceDeleted},
+		{"invalid message ID", nil, tgerr.New(400, "MESSAGE_ID_INVALID"), content.ErrSourceDeleted},
+		{"invalid short message ID", nil, tgerr.New(400, "MSG_ID_INVALID"), content.ErrSourceDeleted},
 		{"temporary failure", nil, errors.New("temporary transport failure"), content.ErrSourceUnavailable},
 		{"different dialog", &tg.MessagesMessages{Messages: []tg.MessageClass{&tg.Message{
 			ID: 81, PeerID: &tg.PeerChat{ChatID: 42}, Message: "foreign",

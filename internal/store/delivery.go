@@ -200,6 +200,18 @@ func (s *Store) SetDeliveryWait(ctx context.Context, chat domain.ChatID, until t
 	return persistWait(ctx, s.db, chat, until)
 }
 
+func (s *Store) AccountWaitUntil(ctx context.Context) (time.Time, error) {
+	var until int64
+	err := s.db.QueryRowContext(ctx, "SELECT until_ns FROM delivery_waits WHERE chat_id = ''").Scan(&until)
+	if errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, nil
+	}
+	if err != nil {
+		return time.Time{}, err
+	}
+	return time.Unix(0, until), nil
+}
+
 type executor interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
 }

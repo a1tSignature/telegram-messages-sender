@@ -111,6 +111,16 @@ func (e *Engine) reconcile(ctx context.Context, transport RecoveryTransport, acc
 			}
 			return time.Time{}, err
 		}
+		until, err := e.state.AccountWaitUntil(recoveryCtx)
+		if errors.Is(err, context.DeadlineExceeded) {
+			return e.now().Add(5 * time.Second), nil
+		}
+		if err != nil {
+			return time.Time{}, err
+		}
+		if until.After(e.now()) {
+			return until, nil
+		}
 		batch, err := transport.Recover(recoveryCtx, current, refs)
 		if err != nil {
 			var wait *telegram.ServerWait

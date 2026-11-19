@@ -11,6 +11,7 @@ import (
 
 	"github.com/gotd/td/telegram/thumbnail"
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 
 	"telegram-messages-sender/internal/content"
 	"telegram-messages-sender/internal/domain"
@@ -175,6 +176,9 @@ func resolveSaved(ctx context.Context, api savedMessagesAPI, account domain.Acco
 	id := int(ref.MessageID)
 	response, err := api.MessagesGetMessages(ctx, []tg.InputMessageClass{&tg.InputMessageID{ID: id}})
 	if err != nil {
+		if ctx.Err() == nil && tgerr.Is(err, "MESSAGE_ID_INVALID", "MSG_ID_INVALID") {
+			return "", content.ErrSourceDeleted
+		}
 		if wait := waitFromError(err); wait != nil {
 			return "", wait
 		}

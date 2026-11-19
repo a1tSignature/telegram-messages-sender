@@ -26,6 +26,8 @@ type SecureStore interface {
 	LoadCredentials(ctx context.Context) (id int, hash string, err error)
 }
 
+var errInvalidStoredSession = errors.New("invalid stored Telegram session")
+
 type Client struct {
 	store        SecureStore
 	boundAccount func(context.Context) (domain.AccountID, error)
@@ -104,14 +106,20 @@ func (c *Client) start(ctx context.Context, prompts *SignInPrompts, use func(con
 		if prompts == nil {
 			return 0, ErrSignInRequired
 		}
+	case errors.Is(err, keychain.ErrInvalid), err == nil && len(data) == 0:
+		if prompts == nil {
+			return 0, secretStoreError(ctx, keychain.ErrInvalid)
+		}
 	case err != nil:
 		return 0, secretStoreError(ctx, err)
-	case len(data) == 0:
-		return 0, keychain.ErrInvalid
 	default:
 		defer clear(data)
 		account, err := c.run(ctx, id, hash, data, nil, use)
-		if prompts == nil || (!errors.Is(err, ErrSessionRevoked) && !errors.Is(err, ErrAccountMismatch)) {
+		if errors.Is(err, errInvalidStoredSession) {
+			if prompts == nil {
+				return 0, secretStoreError(ctx, keychain.ErrInvalid)
+			}
+		} else if prompts == nil || (!errors.Is(err, ErrSessionRevoked) && !errors.Is(err, ErrAccountMismatch)) {
 			return account, err
 		}
 	}
@@ -126,13 +134,16 @@ func (c *Client) run(ctx context.Context, appID int, hash string, initial []byte
 		loader := session.Loader{Storage: saved}
 		data, err := loader.Load(ctx)
 		if err != nil {
-			return 0, secretStoreError(ctx, keychain.ErrInvalid)
+			if ctx.Err() != nil {
+				return 0, ctx.Err()
+			}
+			return 0, errInvalidStoredSession
 		}
 		var key crypto.Key
 		copy(key[:], data.AuthKey)
 		keyID := key.ID()
 		if len(data.AuthKey) != len(key) || !bytes.Equal(data.AuthKeyID, keyID[:]) || key.Zero() {
-			return 0, keychain.ErrInvalid
+			return 0, errInvalidStoredSession
 		}
 		saved.dc = data.DC
 	}
