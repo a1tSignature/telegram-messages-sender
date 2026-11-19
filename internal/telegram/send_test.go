@@ -138,6 +138,8 @@ func TestSubmissionOverLocalMTProto(t *testing.T) {
 			return tgerr.New(400, "MSG_ID_INVALID")
 		case 18:
 			return tgerr.New(406, "CHANNEL_PRIVATE")
+		case 19:
+			return tgerr.New(400, "USER_BANNED_IN_CHANNEL")
 		default:
 			return errors.New("channel lookup did not target the correlated message")
 		}
@@ -340,13 +342,15 @@ func TestSubmissionOverLocalMTProto(t *testing.T) {
 		if err != nil || batch.Checkpoint.PTS != 21 || len(batch.Evidence) != 1 || !batch.Evidence[0].SentAt.IsZero() {
 			return fmt.Errorf("definitively missing message did not allow recovery without confirmation: %+v, %v", batch, err)
 		}
-		ref.MessageID = 18
-		batch, err = recoverDifference(live, client.API(), connection.recoveredMessage, checkpoint, []domain.RecoveryReference{
-			ref, {RandomID: 10, ChatID: "group:12"},
-		})
-		if err != nil || batch.Checkpoint.PTS != 21 || len(batch.Evidence) != 2 ||
-			!batch.Evidence[0].SentAt.IsZero() || batch.Evidence[1].SentAt.Unix() != date {
-			return fmt.Errorf("inaccessible supergroup blocked recovery for another chat: %+v, %v", batch, err)
+		for _, messageID := range []int{18, 19} {
+			ref.MessageID = messageID
+			batch, err = recoverDifference(live, client.API(), connection.recoveredMessage, checkpoint, []domain.RecoveryReference{
+				ref, {RandomID: 10, ChatID: "group:12"},
+			})
+			if err != nil || batch.Checkpoint.PTS != 21 || len(batch.Evidence) != 2 ||
+				!batch.Evidence[0].SentAt.IsZero() || batch.Evidence[1].SentAt.Unix() != date {
+				return fmt.Errorf("inaccessible supergroup message %d blocked recovery for another chat: %+v, %v", messageID, batch, err)
+			}
 		}
 
 		var ready atomic.Bool

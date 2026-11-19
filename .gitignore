@@ -1,3 +1,81 @@
+# Application builds and macOS debug symbols
+/.idea/
 /dist/
 /telegram-messages-sender
 /tmsctl
+/bin/
+/build/
+*.app/
+*.dSYM/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go workspace, test binaries and reports
+go.work
+go.work.sum
+*.test
+*.out
+coverage.txt
+coverage.html
+*.coverprofile
+*.prof
+
+# JetBrains project and editor files
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+
+# macOS filesystem metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Local SQLite databases and sidecar files
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-shm
+*.sqlite3-wal
+
+# Logs
+*.log
+/logs/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+!.env.sample
+
+*.pem
+*.key
+*.p12
+*.pfx
+secrets.json
+credentials.json
+
+# Temporary files
+/tmp/
+/temp/
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+.cache/
