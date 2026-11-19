@@ -82,6 +82,9 @@ func (o *occurrence) refresh(publication domain.Publication, history store.PairD
 				reference = history.LastCompleted
 			}
 			o.due = nextSlot(anchor, publication.Interval, reference)
+			if o.due.Before(o.firstDue) {
+				o.due = nextSlot(anchor, publication.Interval, o.firstDue.Add(-time.Nanosecond))
+			}
 			o.blockedReason = ""
 			o.failures = 0
 			o.retryAt = time.Time{}
@@ -148,7 +151,7 @@ func (s schedule) status(now time.Time, history map[store.Pair]store.PairDeliver
 	result := make([]app.DispatchStatus, 0, len(pairs))
 	for _, pair := range pairs {
 		state := history[pair]
-		status := app.DispatchStatus{PublicationID: pair.PublicationID, ChatID: pair.ChatID, Outcome: state.LastOutcome, Reason: state.Reason}
+		status := app.DispatchStatus{PublicationID: pair.PublicationID, ChatID: pair.ChatID, Outcome: state.LastOutcome, Reason: state.Reason, Unresolved: state.Unresolved}
 		if item := s[pair]; item != nil && state.LastOutcome != domain.AttemptPending && !item.due.IsZero() {
 			if item.blockedReason != "" {
 				status.Reason = item.blockedReason

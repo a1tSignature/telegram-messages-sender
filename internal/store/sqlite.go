@@ -18,6 +18,9 @@ var initialSchema string
 //go:embed migrations/002_delivery.sql
 var deliverySchema string
 
+//go:embed migrations/003_update_checkpoint.sql
+var checkpointSchema string
+
 type Store struct {
 	db *sql.DB
 }
@@ -66,7 +69,7 @@ func migrate(ctx context.Context, db *sql.DB) error {
 	if err := tx.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		return err
 	}
-	schemas := []string{initialSchema, deliverySchema}
+	schemas := []string{initialSchema, deliverySchema, checkpointSchema}
 	if version < 0 || version > len(schemas) {
 		return fmt.Errorf("unsupported schema version %d", version)
 	}

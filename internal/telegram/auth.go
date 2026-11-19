@@ -13,7 +13,6 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
-	"telegram-messages-sender/internal/domain"
 	"telegram-messages-sender/internal/platform/keychain"
 )
 
@@ -24,6 +23,7 @@ var (
 	ErrSessionRevoked     = errors.New("Telegram authorization revoked or expired")
 	ErrSessionUnavailable = errors.New("Telegram session could not be stored or restored")
 	ErrPersonalAccount    = errors.New("Telegram personal account required")
+	ErrAccountMismatch    = errors.New("configuration is bound to a different account")
 	ErrTransport          = errors.New("Telegram transport unavailable")
 	ErrQRDisplay          = errors.New("Telegram QR code could not be displayed")
 	ErrPasswordRequired   = errors.New("Telegram two-step password required")
@@ -96,19 +96,19 @@ func runQR(
 	}
 }
 
-func personalAccount(ctx context.Context, self func(context.Context) (*tg.User, error)) (domain.AccountID, error) {
+func personalAccount(ctx context.Context, self func(context.Context) (*tg.User, error)) (*tg.User, error) {
 	user, err := self(ctx)
 	switch {
 	case ctx.Err() != nil:
-		return 0, ctx.Err()
+		return nil, ctx.Err()
 	case gotd.IsAuthLost(err), tgerr.IsCode(err, 401):
-		return 0, ErrSessionRevoked
+		return nil, ErrSessionRevoked
 	case err != nil:
-		return 0, ErrTransport
+		return nil, ErrTransport
 	case user == nil || user.ID <= 0 || user.Bot:
-		return 0, ErrPersonalAccount
+		return nil, ErrPersonalAccount
 	default:
-		return domain.AccountID(user.ID), nil
+		return user, nil
 	}
 }
 

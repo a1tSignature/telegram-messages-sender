@@ -1,9 +1,12 @@
 package telegram
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"image"
+	"image/jpeg"
 	"io"
 	"net"
 	"path/filepath"
@@ -96,6 +99,93 @@ func TestSubmissionOverLocalMTProto(t *testing.T) {
 			&tg.UpdateMessageID{ID: 11, RandomID: 6},
 		}})
 	})
+	dispatch.HandleFunc(tg.UpdatesGetDifferenceRequestTypeID, func(s *tgtest.Server, req *tgtest.Request) error {
+		var message tg.UpdatesGetDifferenceRequest
+		if err := message.Decode(req.Buf); err != nil {
+			return err
+		}
+		if message.Pts != 20 || message.Qts != 4 || message.Date != date-1 {
+			t.Errorf("difference RPC did not use the stored checkpoint: %+v", message)
+		}
+		return s.SendResult(req, &tg.UpdatesDifference{
+			State: tg.UpdatesState{Pts: 21, Qts: 4, Date: date, Seq: 2},
+			NewMessages: []tg.MessageClass{
+				&tg.Message{ID: 14, Out: true, PeerID: &tg.PeerChat{ChatID: 12}, Date: date},
+				&tg.Message{ID: 14, Out: true, PeerID: &tg.PeerChannel{ChannelID: 55}, Date: date - 2},
+			},
+			OtherUpdates: []tg.UpdateClass{&tg.UpdateMessageID{RandomID: 10, ID: 14}},
+		})
+	})
+
+	dispatch.HandleFunc(tg.ChannelsGetMessagesRequestTypeID, func(s *tgtest.Server, req *tgtest.Request) error {
+		var message tg.ChannelsGetMessagesRequest
+		if err := message.Decode(req.Buf); err != nil {
+			return err
+		}
+		channel, ok := message.Channel.(*tg.InputChannel)
+		if !ok || channel.ChannelID != 55 || channel.AccessHash != 89 || len(message.ID) != 1 {
+			return errors.New("channel lookup did not target the stored supergroup")
+		}
+		id, ok := message.ID[0].(*tg.InputMessageID)
+		if !ok {
+			return errors.New("channel lookup did not target the correlated message")
+		}
+		switch id.ID {
+		case 15:
+		case 16:
+			return tgerr.New(500, "INTERNAL_SERVER_ERROR")
+		case 17:
+			return tgerr.New(400, "MSG_ID_INVALID")
+		default:
+			return errors.New("channel lookup did not target the correlated message")
+		}
+		return s.SendResult(req, &tg.MessagesChannelMessages{Pts: 30, Count: 3, Messages: []tg.MessageClass{
+			&tg.Message{ID: 15, Out: false, PeerID: &tg.PeerChannel{ChannelID: 55}, Date: date - 2},
+			&tg.Message{ID: 15, Out: true, PeerID: &tg.PeerChannel{ChannelID: 72}, Date: date - 1},
+			&tg.Message{ID: 15, Out: true, PeerID: &tg.PeerChannel{ChannelID: 55}, Date: date},
+		}})
+	})
+	dispatch.HandleFunc(tg.MessagesGetDialogsRequestTypeID, func(*tgtest.Server, *tgtest.Request) error {
+		return tgerr.New(500, "INTERNAL_SERVER_ERROR")
+	})
+
+	var thumbnail bytes.Buffer
+	if err := jpeg.Encode(&thumbnail, image.NewRGBA(image.Rect(0, 0, 48, 32)), nil); err != nil {
+		t.Fatal(err)
+	}
+	dispatch.HandleFunc(tg.MessagesGetHistoryRequestTypeID, func(s *tgtest.Server, req *tgtest.Request) error {
+		var request tg.MessagesGetHistoryRequest
+		if err := request.Decode(req.Buf); err != nil {
+			return err
+		}
+		if _, ok := request.Peer.(*tg.InputPeerSelf); !ok {
+			return errors.New("history was not loaded from Saved Messages")
+		}
+		video := &tg.Document{
+			ID: 72, DCID: 2, MimeType: "video/mp4",
+			Thumbs: []tg.PhotoSizeClass{&tg.PhotoSize{Type: "s", W: 48, H: 32, Size: thumbnail.Len()}},
+			Attributes: []tg.DocumentAttributeClass{
+				&tg.DocumentAttributeVideo{W: 1920, H: 1080, Duration: 8.5},
+				&tg.DocumentAttributeFilename{FileName: "sample.mp4"},
+			},
+		}
+		return s.SendResult(req, &tg.MessagesMessages{Messages: []tg.MessageClass{
+			&tg.Message{ID: 72, Out: true, PeerID: &tg.PeerUser{UserID: 42}, Date: date,
+				Media: &tg.MessageMediaDocument{Video: true, Document: video}},
+		}})
+	})
+	dispatch.HandleFunc(tg.UploadGetFileRequestTypeID, func(s *tgtest.Server, req *tgtest.Request) error {
+		var request tg.UploadGetFileRequest
+		if err := request.Decode(req.Buf); err != nil {
+			return err
+		}
+		location, ok := request.Location.(*tg.InputDocumentFileLocation)
+		if !ok || location.ID != 72 || location.ThumbSize != "s" || request.Offset != 0 || request.Limit != thumbnailReadLimit {
+			return errors.New("picker requested something other than the bounded Saved Messages thumbnail")
+		}
+		return s.SendResult(req, &tg.UploadFile{Type: &tg.StorageFileJpeg{}, Bytes: thumbnail.Bytes()})
+	})
+
 	serverDone := make(chan error, 1)
 	go func() { serverDone <- network.Up(ctx) }()
 	defer func() {
@@ -216,6 +306,57 @@ func TestSubmissionOverLocalMTProto(t *testing.T) {
 		if result.Outcome != domain.AttemptSuccess || result.MessageID != 14 {
 			return fmt.Errorf("ending the write context interrupted the response: %+v", result)
 		}
+		batch, err := recoverDifference(live, client.API(), func(context.Context, domain.RecoveryReference) (time.Time, error) {
+			return time.Time{}, nil
+		}, domain.UpdateCheckpoint{PTS: 20, QTS: 4, Date: date - 1}, []domain.RecoveryReference{
+			{RandomID: 10, ChatID: "group:12"},
+			{RandomID: 11, ChatID: "supergroup:55"},
+		})
+		if err != nil || batch.More || batch.Checkpoint.PTS != 21 || len(batch.Evidence) != 1 ||
+			batch.Evidence[0].RandomID != 10 || batch.Evidence[0].MessageID != 14 ||
+			batch.Evidence[0].SentAt.Unix() != date {
+			return fmt.Errorf("recovery did not correlate the persisted random ID: %+v, %v", batch, err)
+		}
+
+		connection := &Connection{api: client.API()}
+		connection.sendPeers.Store(domain.ChatID("supergroup:55"), &tg.InputPeerChannel{ChannelID: 55, AccessHash: 89})
+		sentAt, err := connection.recoveredMessage(live, domain.RecoveryReference{RandomID: 10, ChatID: "supergroup:55", MessageID: 15})
+		if err != nil || sentAt.Unix() != date {
+			return fmt.Errorf("exact supergroup result did not confirm the message: %v, %v", sentAt, err)
+		}
+		checkpoint := domain.UpdateCheckpoint{PTS: 20, QTS: 4, Date: date - 1}
+		ref := domain.RecoveryReference{RandomID: 16, ChatID: "supergroup:55", MessageID: 16}
+		for _, id := range []domain.ChatID{"supergroup:55", "supergroup:56"} {
+			ref.ChatID = id
+			batch, err = recoverDifference(live, client.API(), connection.recoveredMessage, checkpoint, []domain.RecoveryReference{ref})
+			if !errors.Is(err, ErrTransport) || batch.Checkpoint != checkpoint || len(batch.Evidence) != 0 {
+				return fmt.Errorf("incomplete lookup for %s did not preserve the recovery checkpoint: %+v, %v", id, batch, err)
+			}
+		}
+		ref.ChatID, ref.MessageID = "supergroup:55", 17
+		batch, err = recoverDifference(live, client.API(), connection.recoveredMessage, checkpoint, []domain.RecoveryReference{ref})
+		if err != nil || batch.Checkpoint.PTS != 21 || len(batch.Evidence) != 1 || !batch.Evidence[0].SentAt.IsZero() {
+			return fmt.Errorf("definitively missing message did not allow recovery without confirmation: %+v, %v", batch, err)
+		}
+
+		var ready atomic.Bool
+		ready.Store(true)
+		session := &stagedSession{dc: 2}
+		if err := session.commit(live, nil, 2); err != nil {
+			return err
+		}
+		connection.account, connection.ready, connection.ctx, connection.session = 42, &ready, live, session
+		connection.fileDC = client.FileDC
+		page, err := connection.ListSaved(live, 0, 20)
+		if err != nil || len(page.Items) != 1 {
+			return fmt.Errorf("Saved Messages page returned %d items: %v", len(page.Items), err)
+		}
+		item := page.Items[0]
+		if item.Text != "" || item.Media == nil || item.Media.Filename != "sample.mp4" ||
+			!bytes.Equal(item.Media.InlineThumbnail, thumbnail.Bytes()) {
+			return errors.New("captionless Saved Messages media did not retain its fetched preview")
+		}
+
 		return nil
 	})
 	if err != nil {

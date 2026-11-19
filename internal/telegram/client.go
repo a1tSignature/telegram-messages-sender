@@ -5,8 +5,10 @@ import (
 	"context"
 	"errors"
 	"math"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/gotd/td/crypto"
 	"github.com/gotd/td/session"
@@ -26,31 +28,43 @@ type SecureStore interface {
 
 type Client struct {
 	store        SecureStore
+	boundAccount func(context.Context) (domain.AccountID, error)
 	newTransport func(int, string, gotd.Options) *gotd.Client
 	running      atomic.Bool
 }
 
-func NewClient(store SecureStore) *Client {
-	return &Client{store: store, newTransport: gotd.NewClient}
+func NewClient(store SecureStore, boundAccount func(context.Context) (domain.AccountID, error)) *Client {
+	return &Client{store: store, boundAccount: boundAccount, newTransport: gotd.NewClient}
 }
+
+const SustainedInterruption = 5 * time.Second
 
 type Status struct {
 	AccountID          domain.AccountID
+	DisplayName        string
 	TransportAvailable bool
+	Outage             uint64
 }
 
 type Connection struct {
-	api        *tg.Client
-	sendPeers  sync.Map
-	ctx        context.Context
-	account    domain.AccountID
-	ready      *atomic.Bool
-	generation *atomic.Uint64
-	session    *stagedSession
+	api         *tg.Client
+	sendPeers   sync.Map
+	ctx         context.Context
+	account     domain.AccountID
+	displayName string
+	fileDC      func(context.Context, int) (tg.Invoker, error)
+	ready       *atomic.Bool
+	generation  *atomic.Uint64
+	outage      *atomic.Uint64
+	session     *stagedSession
 }
 
 func (c *Connection) Status() Status {
-	return Status{AccountID: c.account, TransportAvailable: c.ctx.Err() == nil && c.ready.Load() && c.session.healthy()}
+	status := Status{AccountID: c.account, DisplayName: c.displayName, TransportAvailable: c.ctx.Err() == nil && c.ready.Load() && c.session.healthy()}
+	if c.outage != nil {
+		status.Outage = c.outage.Load()
+	}
+	return status
 }
 
 // Run checks a saved personal session and runs use for the lifetime of the connection.
@@ -97,7 +111,7 @@ func (c *Client) start(ctx context.Context, prompts *SignInPrompts, use func(con
 	default:
 		defer clear(data)
 		account, err := c.run(ctx, id, hash, data, nil, use)
-		if prompts == nil || !errors.Is(err, ErrSessionRevoked) {
+		if prompts == nil || (!errors.Is(err, ErrSessionRevoked) && !errors.Is(err, ErrAccountMismatch)) {
 			return account, err
 		}
 	}
@@ -123,7 +137,9 @@ func (c *Client) run(ctx context.Context, appID int, hash string, initial []byte
 		saved.dc = data.DC
 	}
 	var ready atomic.Bool
-	var generation atomic.Uint64
+	var generation, outage atomic.Uint64
+	var readinessMu sync.Mutex
+	var offlineAt time.Time
 	dispatcher := tg.NewUpdateDispatcher()
 	loggedIn := qrlogin.OnLoginToken(&dispatcher)
 	options := gotd.Options{
@@ -131,8 +147,21 @@ func (c *Client) run(ctx context.Context, appID int, hash string, initial []byte
 		SessionStorage: saved,
 		UpdateHandler:  dispatcher,
 		OnConnectionState: func(state gotd.ConnectionState) {
+			readinessMu.Lock()
+			defer readinessMu.Unlock()
+			wasReady := ready.Load()
+			isReady := state == gotd.ConnectionStateReady
+			if wasReady && !isReady {
+				offlineAt = time.Now()
+			}
+			if isReady && !offlineAt.IsZero() {
+				if time.Since(offlineAt) >= SustainedInterruption {
+					outage.Add(1)
+				}
+				offlineAt = time.Time{}
+			}
 			generation.Add(1)
-			ready.Store(state == gotd.ConnectionStateReady)
+			ready.Store(isReady)
 		},
 	}
 	// A subscription probe can return a pre-login 401 after QR succeeds.
@@ -146,7 +175,7 @@ func (c *Client) run(ctx context.Context, appID int, hash string, initial []byte
 	transport := c.newTransport(appID, hash, options)
 
 	var account domain.AccountID
-	var callbackErr error
+	var callbackErr, bindingErr error
 	err := transport.Run(ctx, func(live context.Context) (err error) {
 		defer func() { callbackErr = err }()
 		if prompts != nil {
@@ -155,17 +184,34 @@ func (c *Client) run(ctx context.Context, appID int, hash string, initial []byte
 				return err
 			}
 		}
-		selfID, err := personalAccount(live, transport.Self)
+		self, err := personalAccount(live, transport.Self)
 		if err != nil {
 			return err
+		}
+		verifiedAccount := domain.AccountID(self.ID)
+		bound, err := c.boundAccount(live)
+		if err != nil {
+			bindingErr = err
+			return err
+		}
+		if bound != 0 && verifiedAccount != bound {
+			bindingErr = ErrAccountMismatch
+			return bindingErr
 		}
 		if err := saved.commit(live, initial, transport.Config().ThisDC); err != nil {
 			return err
 		}
 
-		account = selfID
+		account = verifiedAccount
 		if use != nil {
-			conn := &Connection{api: transport.API(), ctx: live, account: account, ready: &ready, generation: &generation, session: saved}
+			name := strings.TrimSpace(self.FirstName + " " + self.LastName)
+			if name == "" && self.Username != "" {
+				name = "@" + self.Username
+			}
+			conn := &Connection{
+				api: transport.API(), ctx: live, account: account, displayName: name, fileDC: transport.FileDC,
+				ready: &ready, generation: &generation, outage: &outage, session: saved,
+			}
 			return use(live, conn)
 		}
 		return nil
@@ -174,6 +220,8 @@ func (c *Client) run(ctx context.Context, appID int, hash string, initial []byte
 	switch {
 	case ctx.Err() != nil, errors.Is(err, ErrSessionRevoked), gotd.IsAuthLost(err):
 		return 0, connectionError(ctx, err)
+	case bindingErr != nil:
+		return 0, bindingErr
 	case account != 0 && callbackErr != nil:
 		return account, callbackErr
 	case err != nil:

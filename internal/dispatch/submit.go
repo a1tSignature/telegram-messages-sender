@@ -48,11 +48,17 @@ func (e *Engine) deliver(ctx context.Context, transport Transport, revision int6
 
 	var attempt int64
 	var beginErr error
-	submitCtx, cancelSend := context.WithTimeout(ctx, 20*time.Second)
+	submitCtx, cancelSend := drainingSubmission(ctx)
 	defer cancelSend()
 	result := send(submitCtx, randomID, func(writeCtx context.Context, write func(context.Context) error) error {
 		e.gate.Lock()
 		defer e.gate.Unlock()
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !e.recoveryReady(transport) {
+			return telegram.ErrTransport
+		}
 		handoffCtx, cancelHandoff := context.WithTimeout(writeCtx, submissionHandoffTimeout)
 		defer cancelHandoff()
 		if err := handoffCtx.Err(); err != nil {
@@ -67,6 +73,12 @@ func (e *Engine) deliver(ctx context.Context, transport Transport, revision int6
 		})
 		if beginErr != nil {
 			return beginErr
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !e.recoveryReady(transport) {
+			return telegram.ErrTransport
 		}
 		return write(handoffCtx)
 	})
@@ -117,6 +129,17 @@ func (e *Engine) deliver(ctx context.Context, transport Transport, revision int6
 		e.deferPair(work.pair, result.Reason)
 	}
 	return nil
+}
+
+func (e *Engine) recoveryReady(transport Transport) bool {
+	if e.wakeGeneration.Load() != e.recoveredWake {
+		return false
+	}
+	if current, ok := transport.(RecoveryTransport); ok {
+		status := current.Status()
+		return status.TransportAvailable && status.Outage == e.recoveredOutage
+	}
+	return true
 }
 
 func (e *Engine) handlePreparationError(ctx context.Context, revision int64, pair store.Pair, err error) error {

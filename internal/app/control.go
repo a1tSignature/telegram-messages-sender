@@ -52,10 +52,24 @@ type DispatchStatus struct {
 	DueAt         *time.Time            `json:"due_at,omitempty"`
 	Delay         time.Duration         `json:"delay_ns"`
 	Outcome       domain.AttemptOutcome `json:"outcome,omitempty"`
+	Unresolved    int                   `json:"unresolved,omitempty"`
 	Reason        string                `json:"reason,omitempty"`
 }
 
+type WaitStatus struct {
+	ChatID domain.ChatID `json:"chat_id,omitempty"`
+	Until  time.Time     `json:"until"`
+}
+
+type SessionStatus struct {
+	AccountID          domain.AccountID `json:"account_id"`
+	DisplayName        string           `json:"display_name,omitempty"`
+	TransportAvailable bool             `json:"transport_available"`
+}
+
 type Result struct {
+	Session       *SessionStatus       `json:"session,omitempty"`
+	Waits         []WaitStatus         `json:"waits,omitempty"`
 	Dispatch      []DispatchStatus     `json:"dispatch,omitempty"`
 	DispatchError string               `json:"dispatch_error,omitempty"`
 	Revision      int64                `json:"revision"`

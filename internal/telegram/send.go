@@ -87,41 +87,41 @@ func (c *Connection) destination(ctx context.Context, chat domain.ChatID, kind c
 	if !c.Status().TransportAvailable {
 		return nil, DestinationCheck{State: DestinationCheckUnavailable}
 	}
-	peer, check := c.resolveDestination(ctx, chat)
+	peer, state, err := c.resolveDestination(ctx, chat)
 	if peer == nil {
-		return nil, check
+		return nil, DestinationCheck{State: state, Wait: waitFromError(err)}
 	}
-	check = c.CheckDestination(ctx, peer, kind)
+	check := c.CheckDestination(ctx, peer, kind)
 	if check.State == DestinationCheckUnavailable {
 		c.sendPeers.Delete(chat)
 	}
 	return peer, check
 }
 
-func (c *Connection) resolveDestination(ctx context.Context, chat domain.ChatID) (tg.InputPeerClass, DestinationCheck) {
+func (c *Connection) resolveDestination(ctx context.Context, chat domain.ChatID) (tg.InputPeerClass, DestinationState, error) {
 	prefix, idText, _ := strings.Cut(string(chat), ":")
 	id, err := strconv.ParseInt(idText, 10, 64)
 	if err != nil || id <= 0 || strconv.FormatInt(id, 10) != idText {
-		return nil, DestinationCheck{State: DestinationUnsupported}
+		return nil, DestinationUnsupported, nil
 	}
 	switch prefix {
 	case "group":
-		return &tg.InputPeerChat{ChatID: id}, DestinationCheck{}
+		return &tg.InputPeerChat{ChatID: id}, "", nil
 	case "supergroup":
 		if cached, ok := c.sendPeers.Load(chat); ok {
-			return cached.(*tg.InputPeerChannel), DestinationCheck{}
+			return cached.(*tg.InputPeerChannel), "", nil
 		}
 		iter := dialogs.NewQueryBuilder(c.api).GetDialogs().BatchSize(100).Iter()
 		for iter.Next(ctx) {
 			peer, ok := iter.Value().Peer.(*tg.InputPeerChannel)
 			if ok && peer.ChannelID == id && peer.AccessHash != 0 {
 				c.sendPeers.Store(chat, peer)
-				return peer, DestinationCheck{}
+				return peer, "", nil
 			}
 		}
-		return nil, DestinationCheck{State: DestinationCheckUnavailable, Wait: waitFromError(iter.Err())}
+		return nil, DestinationCheckUnavailable, iter.Err()
 	default:
-		return nil, DestinationCheck{State: DestinationUnsupported}
+		return nil, DestinationUnsupported, nil
 	}
 }
 

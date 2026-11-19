@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"math/rand/v2"
+	"slices"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"telegram-messages-sender/internal/app"
@@ -13,15 +16,18 @@ import (
 )
 
 type Engine struct {
-	state *store.Store
-	now   func() time.Time
-	draw  func(int) int
-	wake  chan struct{}
+	state          *store.Store
+	now            func() time.Time
+	draw           func(int) int
+	wake           chan struct{}
+	wakeGeneration atomic.Uint64
 
-	gate          sync.Mutex
-	queue         schedule
-	transport     Transport
-	dispatchError string
+	gate            sync.Mutex
+	queue           schedule
+	recoveredWake   uint64
+	recoveredOutage uint64
+	transport       Transport
+	dispatchError   string
 }
 
 func New(state *store.Store) *Engine {
@@ -32,7 +38,22 @@ func newEngine(state *store.Store, now func() time.Time, draw func(int) int) *En
 	return &Engine{state: state, now: now, draw: draw, queue: make(schedule), wake: make(chan struct{}, 1)}
 }
 
-func (e *Engine) Run(ctx context.Context, transport Transport) (err error) {
+func (e *Engine) Run(ctx context.Context, transport Transport) error {
+	return e.run(ctx, transport, func(ctx context.Context) error {
+		for ctx.Err() == nil {
+			wake, worked, err := e.step(ctx, transport)
+			if err != nil {
+				return err
+			}
+			if !worked {
+				e.wait(ctx, wake)
+			}
+		}
+		return nil
+	})
+}
+
+func (e *Engine) run(ctx context.Context, transport Transport, work func(context.Context) error) (err error) {
 	e.gate.Lock()
 	if e.transport != nil {
 		e.gate.Unlock()
@@ -50,19 +71,10 @@ func (e *Engine) Run(ctx context.Context, transport Transport) (err error) {
 		}
 	}()
 
-	for ctx.Err() == nil {
-		wake, worked, err := e.step(ctx, transport)
-		if err != nil {
-			return err
-		}
-		if !worked {
-			e.wait(ctx, wake)
-		}
-	}
-	return nil
+	return work(ctx)
 }
 
-func (e *Engine) wait(ctx context.Context, at time.Time) {
+func (e *Engine) wait(ctx context.Context, at time.Time) bool {
 	var elapsed <-chan time.Time
 	if !at.IsZero() {
 		timer := time.NewTimer(at.Sub(e.now()))
@@ -73,7 +85,9 @@ func (e *Engine) wait(ctx context.Context, at time.Time) {
 	case <-ctx.Done():
 	case <-elapsed:
 	case <-e.wake:
+		return true
 	}
+	return false
 }
 
 func (e *Engine) step(ctx context.Context, transport Transport) (time.Time, bool, error) {
@@ -133,8 +147,25 @@ func (e *Engine) Status(ctx context.Context) (app.Result, error) {
 	if err != nil {
 		return app.Result{}, err
 	}
-	result.Dispatch = e.queue.status(e.now(), delivery.Pairs)
+	now := e.now()
+	result.Dispatch = e.queue.status(now, delivery.Pairs)
+	for chat, until := range delivery.Waits {
+		if until.After(now) {
+			result.Waits = append(result.Waits, app.WaitStatus{ChatID: chat, Until: until})
+		}
+	}
+	slices.SortFunc(result.Waits, func(a, b app.WaitStatus) int {
+		return strings.Compare(string(a.ChatID), string(b.ChatID))
+	})
 	result.DispatchError = e.dispatchError
+	if transport, ok := e.transport.(RecoveryTransport); ok {
+		status := transport.Status()
+		if status.AccountID > 0 {
+			result.Session = &app.SessionStatus{
+				AccountID: status.AccountID, DisplayName: status.DisplayName, TransportAvailable: status.TransportAvailable,
+			}
+		}
+	}
 	return result, nil
 }
 

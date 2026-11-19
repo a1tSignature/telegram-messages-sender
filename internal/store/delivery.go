@@ -22,6 +22,7 @@ type PairDelivery struct {
 	LastOutcome      domain.AttemptOutcome
 	LastCompleted    time.Time
 	Reason           string
+	Unresolved       int
 }
 
 type DeliveryState struct {
@@ -57,7 +58,9 @@ func (s *Store) DeliveryState(ctx context.Context) (DeliveryState, error) {
 	result := DeliveryState{Pairs: make(map[Pair]PairDelivery), Waits: make(map[domain.ChatID]time.Time)}
 	err = scanRows(ctx, tx, `
 		SELECT p.publication_id, p.chat_id, p.first_due_ns, p.confirmed_ns,
-		       coalesce(p.confirmed_variant, ''), coalesce(a.outcome, ''), a.completed_ns, coalesce(a.reason, '')
+		       coalesce(p.confirmed_variant, ''), coalesce(a.outcome, ''), a.completed_ns, coalesce(a.reason, ''),
+		       (SELECT count(*) FROM delivery_attempts u WHERE u.publication_id = p.publication_id
+		          AND u.chat_id = p.chat_id AND u.outcome IN ('pending', 'unknown'))
 		FROM delivery_pairs p
 		LEFT JOIN delivery_attempts a ON a.id = (
 		    SELECT id FROM delivery_attempts WHERE publication_id = p.publication_id AND chat_id = p.chat_id
@@ -66,7 +69,7 @@ func (s *Store) DeliveryState(ctx context.Context) (DeliveryState, error) {
 		var delivery PairDelivery
 		var first int64
 		var confirmed, completed sql.NullInt64
-		if err := rows.Scan(&pair.PublicationID, &pair.ChatID, &first, &confirmed, &delivery.ConfirmedVariant, &delivery.LastOutcome, &completed, &delivery.Reason); err != nil {
+		if err := rows.Scan(&pair.PublicationID, &pair.ChatID, &first, &confirmed, &delivery.ConfirmedVariant, &delivery.LastOutcome, &completed, &delivery.Reason, &delivery.Unresolved); err != nil {
 			return err
 		}
 		delivery.FirstDue = time.Unix(0, first)
@@ -147,10 +150,17 @@ func (s *Store) FinishSubmission(ctx context.Context, id int64, result DeliveryR
 	}
 	defer tx.Rollback()
 
+	if err := finishSubmission(ctx, tx, id, result); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func finishSubmission(ctx context.Context, tx *sql.Tx, id int64, result DeliveryResult) error {
 	var pair Pair
 	var variant domain.VariantID
 	var submitted int64
-	err = tx.QueryRowContext(ctx, `
+	err := tx.QueryRowContext(ctx, `
 		UPDATE delivery_attempts SET outcome = ?, completed_ns = ?, telegram_message_id = ?, reason = ?
 		WHERE id = ? AND (outcome = 'pending' OR (outcome = 'unknown' AND ? = 'success'))
 		RETURNING publication_id, chat_id, variant_id, submitted_ns`, result.Outcome, result.CompletedAt.UnixNano(),
@@ -183,7 +193,7 @@ func (s *Store) FinishSubmission(ctx context.Context, id int64, result DeliveryR
 			return err
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 func (s *Store) SetDeliveryWait(ctx context.Context, chat domain.ChatID, until time.Time) error {

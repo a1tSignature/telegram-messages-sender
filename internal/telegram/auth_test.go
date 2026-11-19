@@ -1,9 +1,11 @@
 package telegram
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"math/big"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,6 +23,7 @@ import (
 	"github.com/gotd/td/tgtest/cluster"
 
 	"telegram-messages-sender/internal/platform/keychain"
+	"telegram-messages-sender/internal/store"
 )
 
 type rpcFixture func(input bin.Encoder) (bin.Encoder, error)
@@ -174,7 +177,13 @@ func TestDedicatedSessionOverLocalMTProto(t *testing.T) {
 
 	network := cluster.NewCluster(cluster.Options{})
 	dispatch := network.Dispatch(2, "local Telegram fixture")
-	var accepted atomic.Pointer[[8]byte]
+	type authorization struct {
+		key  [8]byte
+		user *tg.User
+	}
+	var accepted atomic.Pointer[authorization]
+	var loginAccount atomic.Int64
+	loginAccount.Store(42)
 	var logins atomic.Int32
 	var presentQR atomic.Bool
 	type delayedProbe struct {
@@ -183,20 +192,19 @@ func TestDedicatedSessionOverLocalMTProto(t *testing.T) {
 		request  *tgtest.Request
 	}
 	var stale atomic.Pointer[delayedProbe]
-	user := &tg.User{ID: 42, Self: true}
 	dispatch.HandleFunc(tg.AuthExportLoginTokenRequestTypeID, func(s *tgtest.Server, req *tgtest.Request) error {
 		logins.Add(1)
 		if presentQR.Load() {
 			return s.SendResult(req, &tg.AuthLoginToken{Token: []byte("fixture-token"), Expires: int(time.Now().Add(time.Minute).Unix())})
 		}
-		key := [8]byte(req.Session.AuthKey.ID)
-		accepted.Store(&key)
+		user := &tg.User{ID: loginAccount.Load(), Self: true, FirstName: "Fixture", LastName: "Publisher"}
+		accepted.Store(&authorization{key: [8]byte(req.Session.AuthKey.ID), user: user})
 		return s.SendResult(req, &tg.AuthLoginTokenSuccess{Authorization: &tg.AuthAuthorization{User: user}})
 	})
 	dispatch.HandleFunc(tg.UsersGetUsersRequestTypeID, func(s *tgtest.Server, req *tgtest.Request) error {
 		unauthorized := tgerr.New(401, "AUTH_KEY_UNREGISTERED")
 		probe := stale.Load()
-		if key := accepted.Load(); key != nil && *key == [8]byte(req.Session.AuthKey.ID) {
+		if account := accepted.Load(); account != nil && account.key == [8]byte(req.Session.AuthKey.ID) {
 			if probe != nil {
 				if err := s.SendErr(probe.request, unauthorized); err != nil {
 					return err
@@ -207,7 +215,7 @@ func TestDedicatedSessionOverLocalMTProto(t *testing.T) {
 					return req.RequestCtx.Err()
 				}
 			}
-			return s.SendVector(req, user)
+			return s.SendVector(req, account.user)
 		}
 		if probe != nil {
 			probe.request = req
@@ -231,8 +239,13 @@ func TestDedicatedSessionOverLocalMTProto(t *testing.T) {
 	}
 
 	storage := &localSecureStore{}
+	state, err := store.Open(ctx, filepath.Join(t.TempDir(), "bound.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
 	newClient := func() *Client {
-		client := NewClient(storage)
+		client := NewClient(storage, state.BoundAccount)
 		client.newTransport = func(id int, hash string, opts gotd.Options) *gotd.Client {
 			opts.PublicKeys = network.Keys()
 			opts.Resolver = network.Resolver()
@@ -264,8 +277,8 @@ func TestDedicatedSessionOverLocalMTProto(t *testing.T) {
 	var lastConnection *Connection
 	check := func(ctx context.Context, conn *Connection) error {
 		lastConnection = conn
-		if status := conn.Status(); status.AccountID != expectedID {
-			t.Errorf("unexpected authorized account %d", status.AccountID)
+		if status := conn.Status(); status.AccountID != expectedID || status.DisplayName != "Fixture Publisher" {
+			t.Errorf("unexpected authorized account status: %+v", status)
 		}
 		ticks := time.NewTicker(time.Millisecond)
 		defer ticks.Stop()
@@ -285,7 +298,7 @@ func TestDedicatedSessionOverLocalMTProto(t *testing.T) {
 
 	presentQR.Store(true)
 	cancelled, stop := context.WithCancel(ctx)
-	_, err := newClient().SignIn(cancelled, SignInPrompts{ShowQR: func(context.Context, string, time.Time) error {
+	_, err = newClient().SignIn(cancelled, SignInPrompts{ShowQR: func(context.Context, string, time.Time) error {
 		stop()
 		return nil
 	}})
@@ -333,6 +346,47 @@ func TestDedicatedSessionOverLocalMTProto(t *testing.T) {
 	}
 	if id, err := newClient().SignIn(ctx, prompts); err != nil || id != expectedID || logins.Load() != before+1 {
 		t.Fatalf("explicit request did not replace the revoked authorization: account %d, %v", id, err)
+	}
+
+	const boundID = 43
+	if _, err := state.BindAccount(ctx, boundID); err != nil {
+		t.Fatal(err)
+	}
+	previousSession, err := storage.LoadSession(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before = logins.Load()
+	if err := newClient().Run(ctx, check); !errors.Is(err, ErrAccountMismatch) || logins.Load() != before {
+		t.Fatalf("passive startup did not reject the mismatched session: %v", err)
+	}
+	presentQR.Store(true)
+	qrShown := false
+	if id, err := newClient().SignIn(ctx, SignInPrompts{ShowQR: func(context.Context, string, time.Time) error {
+		qrShown = true
+		return context.Canceled
+	}}); !qrShown || !errors.Is(err, context.Canceled) || id != 0 {
+		t.Fatalf("explicit sign-in did not show a fresh QR: shown=%v, account=%d, err=%v", qrShown, id, err)
+	}
+	presentQR.Store(false)
+	if id, err := newClient().SignIn(ctx, prompts); !errors.Is(err, ErrAccountMismatch) || id != 0 {
+		t.Fatalf("fresh QR accepted a different account: account=%d, err=%v", id, err)
+	}
+	if currentSession, err := storage.LoadSession(ctx); err != nil || !bytes.Equal(previousSession, currentSession) {
+		t.Fatalf("rejected sign-in replaced the saved authorization: %v", err)
+	}
+	loginAccount.Store(boundID)
+	if id, err := newClient().SignIn(ctx, prompts); err != nil || id != boundID {
+		t.Fatalf("fresh QR failed to recover the bound account: account=%d, err=%v", id, err)
+	}
+	before = logins.Load()
+	if err := newClient().Run(ctx, func(_ context.Context, conn *Connection) error {
+		if conn.Status().AccountID != boundID {
+			return errors.New("saved session belongs to the wrong account")
+		}
+		return nil
+	}); err != nil || logins.Load() != before {
+		t.Fatalf("did not reuse the recovered session for the bound account: %v", err)
 	}
 }
 

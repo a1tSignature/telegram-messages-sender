@@ -1,7 +1,11 @@
 package telegram
 
 import (
+	"bytes"
 	"context"
+	"image"
+	_ "image/jpeg"
+	_ "image/png"
 	"math"
 	"time"
 
@@ -50,7 +54,62 @@ func (c *Connection) ListSaved(ctx context.Context, offset, limit int) (SavedPag
 	if !c.Status().TransportAvailable {
 		return SavedPage{}, content.ErrSourceUnavailable
 	}
-	return listSaved(ctx, c.api, c.account, offset, limit)
+	page, err := listSaved(ctx, c.api, c.account, offset, limit)
+	if err != nil || c.fileDC == nil {
+		return page, err
+	}
+	c.loadSavedThumbnails(ctx, page.Items)
+	if err := ctx.Err(); err != nil {
+		return SavedPage{}, err
+	}
+	return page, nil
+}
+
+const thumbnailReadLimit = 128 * 1024
+
+func (c *Connection) loadSavedThumbnails(ctx context.Context, items []SavedPreview) {
+	// A slow thumbnail DC must not hold the complete Saved Messages page.
+	ctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+	for i := range items {
+		media := items[i].Media
+		if ctx.Err() != nil {
+			return
+		}
+		if items[i].Unavailable != nil || media == nil || len(media.InlineThumbnail) != 0 || media.ThumbnailDC <= 0 {
+			continue
+		}
+		switch location := media.ThumbnailLocation.(type) {
+		case *tg.InputPhotoFileLocation:
+			if location.ThumbSize == "" {
+				continue
+			}
+		case *tg.InputDocumentFileLocation:
+			if location.ThumbSize == "" {
+				continue
+			}
+		default:
+			continue
+		}
+		invoker, err := c.fileDC(ctx, media.ThumbnailDC)
+		if err != nil {
+			continue
+		}
+		result, err := tg.NewClient(invoker).UploadGetFile(ctx, &tg.UploadGetFileRequest{
+			Location: media.ThumbnailLocation, Limit: thumbnailReadLimit,
+		})
+		if waitFromError(err) != nil {
+			return
+		}
+		file, ok := result.(*tg.UploadFile)
+		if err != nil || !ok || len(file.Bytes) == 0 || len(file.Bytes) >= thumbnailReadLimit {
+			continue
+		}
+		config, _, err := image.DecodeConfig(bytes.NewReader(file.Bytes))
+		if err == nil && config.Width > 0 && config.Height > 0 && config.Width <= 2048 && config.Height <= 2048 {
+			media.InlineThumbnail = file.Bytes
+		}
+	}
 }
 
 func (c *Connection) ResolveSaved(ctx context.Context, ref domain.SavedMessage) (content.Kind, error) {

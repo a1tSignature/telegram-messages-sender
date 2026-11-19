@@ -24,6 +24,12 @@ type Snapshot struct {
 	Paused        map[domain.PublicationID]app.StatusReason
 }
 
+func (s *Store) BoundAccount(ctx context.Context) (domain.AccountID, error) {
+	var id domain.AccountID
+	err := s.db.QueryRowContext(ctx, "SELECT coalesce(account_id, 0) FROM configuration").Scan(&id)
+	return id, err
+}
+
 func (s *Store) BindAccount(ctx context.Context, id domain.AccountID) (int64, error) {
 	return s.change(ctx, func(tx *sql.Tx) error {
 		result, err := tx.ExecContext(ctx, `
