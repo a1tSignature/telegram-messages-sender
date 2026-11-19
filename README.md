@@ -17,7 +17,7 @@ open dist/telegram-messages-sender.app
 ./dist/tmsctl status
 ```
 
-The script builds both arm64 executables with CGO, verifies their Mach-O deployment target and the app's Info.plist, and applies a local ad-hoc signature. It writes the app bundle and standalone CLI to `dist/`. Local package version: `0.1.0`.
+The script builds both arm64 executables with CGO, verifies their Mach-O deployment target and the app's Info.plist, and applies a local ad-hoc signature. It writes the app bundle and standalone CLI to `dist/`. Local package version: `1.0.0`.
 
 ## Set up Telegram
 
