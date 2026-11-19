@@ -15,6 +15,9 @@ import (
 //go:embed migrations/001_initial.sql
 var initialSchema string
 
+//go:embed migrations/002_delivery.sql
+var deliverySchema string
+
 type Store struct {
 	db *sql.DB
 }
@@ -63,17 +66,18 @@ func migrate(ctx context.Context, db *sql.DB) error {
 	if err := tx.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		return err
 	}
-	switch version {
-	case 0:
-		if _, err := tx.ExecContext(ctx, initialSchema); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, "PRAGMA user_version = 1"); err != nil {
-			return err
-		}
-	case 1:
-	default:
+	schemas := []string{initialSchema, deliverySchema}
+	if version < 0 || version > len(schemas) {
 		return fmt.Errorf("unsupported schema version %d", version)
+	}
+	for _, schema := range schemas[version:] {
+		if _, err := tx.ExecContext(ctx, schema); err != nil {
+			return err
+		}
+		version++
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", version)); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }

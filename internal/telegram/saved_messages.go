@@ -116,6 +116,9 @@ func resolveSaved(ctx context.Context, api savedMessagesAPI, account domain.Acco
 	id := int(ref.MessageID)
 	response, err := api.MessagesGetMessages(ctx, []tg.InputMessageClass{&tg.InputMessageID{ID: id}})
 	if err != nil {
+		if wait := waitFromError(err); wait != nil {
+			return "", wait
+		}
 		return "", savedLookupError(ctx)
 	}
 	messages, ok := savedResults(response)

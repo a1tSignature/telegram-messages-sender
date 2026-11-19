@@ -35,6 +35,7 @@ type DestinationCheck struct {
 	Role        DestinationRole
 	SendAs      tg.InputPeerClass
 	Replacement *tg.InputPeerChannel
+	Wait        *ServerWait
 }
 
 type destinationAPI interface {
@@ -49,8 +50,8 @@ func (c *Connection) CheckDestination(ctx context.Context, peer tg.InputPeerClas
 		return DestinationCheck{State: DestinationCheckUnavailable}
 	}
 	result := checkDestination(ctx, c.api, c.account, peer, kind, time.Now)
-	if ctx.Err() != nil || !c.Status().TransportAvailable {
-		return DestinationCheck{State: DestinationCheckUnavailable}
+	if result.State != DestinationAdminLost && (ctx.Err() != nil || !c.Status().TransportAvailable) {
+		return DestinationCheck{State: DestinationCheckUnavailable, Wait: result.Wait}
 	}
 	return result
 }
@@ -82,6 +83,7 @@ func checkBasicGroup(ctx context.Context, api destinationAPI, account domain.Acc
 	unavailable := DestinationCheck{State: DestinationCheckUnavailable}
 	response, err := api.MessagesGetFullChat(ctx, id)
 	if err != nil || response == nil {
+		unavailable.Wait = waitFromError(err)
 		return unavailable
 	}
 	var chat *tg.Chat
@@ -162,6 +164,7 @@ func checkSupergroup(ctx context.Context, api destinationAPI, account domain.Acc
 		return DestinationCheck{State: DestinationAdminLost}
 	}
 	if err != nil {
+		unavailable.Wait = waitFromError(err)
 		return unavailable
 	}
 	response, ok := chats.(interface{ GetChats() []tg.ChatClass })
@@ -199,6 +202,7 @@ func checkSupergroup(ctx context.Context, api destinationAPI, account domain.Acc
 		return DestinationCheck{State: DestinationAdminLost}
 	}
 	if err != nil || participant == nil {
+		unavailable.Wait = waitFromError(err)
 		return unavailable
 	}
 
@@ -218,6 +222,7 @@ func checkSupergroup(ctx context.Context, api destinationAPI, account domain.Acc
 	senders, err := api.ChannelsGetSendAs(ctx, &tg.ChannelsGetSendAsRequest{Peer: peer})
 	if err != nil || senders == nil {
 		result.State = DestinationCheckUnavailable
+		result.Wait = waitFromError(err)
 		return result
 	}
 	for _, sender := range senders.Peers {

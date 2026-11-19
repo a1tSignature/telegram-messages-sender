@@ -28,8 +28,9 @@ type Command struct {
 type StatusReason string
 
 const (
-	ReasonManualStop   StatusReason = "manual_stop"
-	ReasonChatDisabled StatusReason = "chat_disabled"
+	ReasonManualStop        StatusReason = "manual_stop"
+	ReasonVariantsExhausted StatusReason = "variants_exhausted"
+	ReasonChatDisabled      StatusReason = "chat_disabled"
 )
 
 type DisabledChatStatus struct {
@@ -45,7 +46,18 @@ type PublicationStatus struct {
 	Destinations []domain.ChatID         `json:"destinations"`
 }
 
+type DispatchStatus struct {
+	PublicationID domain.PublicationID  `json:"publication_id"`
+	ChatID        domain.ChatID         `json:"chat_id"`
+	DueAt         *time.Time            `json:"due_at,omitempty"`
+	Delay         time.Duration         `json:"delay_ns"`
+	Outcome       domain.AttemptOutcome `json:"outcome,omitempty"`
+	Reason        string                `json:"reason,omitempty"`
+}
+
 type Result struct {
+	Dispatch      []DispatchStatus     `json:"dispatch,omitempty"`
+	DispatchError string               `json:"dispatch_error,omitempty"`
 	Revision      int64                `json:"revision"`
 	Publications  []PublicationStatus  `json:"publications,omitempty"`
 	DisabledChats []DisabledChatStatus `json:"disabled_chats,omitempty"`

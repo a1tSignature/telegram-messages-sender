@@ -12,6 +12,7 @@ import (
 	"github.com/gotd/td/session"
 	gotd "github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/auth/qrlogin"
+	"github.com/gotd/td/telegram/dcs"
 	"github.com/gotd/td/tg"
 
 	"telegram-messages-sender/internal/domain"
@@ -39,11 +40,13 @@ type Status struct {
 }
 
 type Connection struct {
-	api     *tg.Client
-	ctx     context.Context
-	account domain.AccountID
-	ready   *atomic.Bool
-	session *stagedSession
+	api        *tg.Client
+	sendPeers  sync.Map
+	ctx        context.Context
+	account    domain.AccountID
+	ready      *atomic.Bool
+	generation *atomic.Uint64
+	session    *stagedSession
 }
 
 func (c *Connection) Status() Status {
@@ -120,12 +123,15 @@ func (c *Client) run(ctx context.Context, appID int, hash string, initial []byte
 		saved.dc = data.DC
 	}
 	var ready atomic.Bool
+	var generation atomic.Uint64
 	dispatcher := tg.NewUpdateDispatcher()
 	loggedIn := qrlogin.OnLoginToken(&dispatcher)
 	options := gotd.Options{
+		Resolver:       publicationResolver{Resolver: dcs.DefaultResolver()},
 		SessionStorage: saved,
 		UpdateHandler:  dispatcher,
 		OnConnectionState: func(state gotd.ConnectionState) {
+			generation.Add(1)
 			ready.Store(state == gotd.ConnectionStateReady)
 		},
 	}
@@ -159,7 +165,7 @@ func (c *Client) run(ctx context.Context, appID int, hash string, initial []byte
 
 		account = selfID
 		if use != nil {
-			conn := &Connection{api: transport.API(), ctx: live, account: account, ready: &ready, session: saved}
+			conn := &Connection{api: transport.API(), ctx: live, account: account, ready: &ready, generation: &generation, session: saved}
 			return use(live, conn)
 		}
 		return nil
@@ -187,7 +193,7 @@ type stagedSession struct {
 	dc        int
 	changed   chan struct{}
 	committed bool
-	failed    bool
+	available atomic.Bool
 }
 
 func (s *stagedSession) LoadSession(ctx context.Context) ([]byte, error) {
@@ -211,9 +217,8 @@ func (s *stagedSession) StoreSession(ctx context.Context, data []byte) error {
 		return err
 	}
 	if s.committed {
-		err := s.store.StoreSession(ctx, bytes.Clone(data))
-		s.failed = err != nil
-		if err != nil {
+		s.available.Store(false)
+		if err := s.store.StoreSession(ctx, bytes.Clone(data)); err != nil {
 			return secretStoreError(ctx, err)
 		}
 	} else {
@@ -230,6 +235,7 @@ func (s *stagedSession) StoreSession(ctx context.Context, data []byte) error {
 	}
 	clear(s.data)
 	s.data = bytes.Clone(data)
+	s.available.Store(s.committed)
 	if s.changed != nil {
 		close(s.changed)
 		s.changed = nil
@@ -269,18 +275,19 @@ func (s *stagedSession) commitWhenCurrent(ctx context.Context, initial []byte, p
 		return s.changed, nil
 	}
 	if !bytes.Equal(s.data, initial) {
+		s.available.Store(false)
 		if err := s.store.StoreSession(ctx, bytes.Clone(s.data)); err != nil {
 			return nil, secretStoreError(ctx, err)
 		}
 	}
 	s.committed = true
+	s.available.Store(true)
 	return nil, nil
 }
 
 func (s *stagedSession) healthy() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.committed && !s.failed
+	// Dispatch can read readiness while holding its submission gate.
+	return s.available.Load()
 }
 
 func (s *stagedSession) clear() {

@@ -3,9 +3,11 @@ package telegram
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
@@ -138,5 +140,30 @@ func TestSupergroupVerification(t *testing.T) {
 				t.Fatal("only a verified personal identity can supply an explicit sender")
 			}
 		})
+	}
+}
+
+func TestConfirmedDestinationLossSurvivesCancellationDuringRPC(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	var ready atomic.Bool
+	ready.Store(true)
+	saved := &stagedSession{dc: 2}
+	if err := saved.commit(t.Context(), nil, 2); err != nil {
+		t.Fatal(err)
+	}
+	connection := &Connection{
+		ctx: t.Context(), account: 42, ready: &ready, session: saved,
+		api: tg.NewClient(rpcFixture(func(bin.Encoder) (bin.Encoder, error) {
+			cancel()
+			return &tg.MessagesChatFull{
+				FullChat: &tg.ChatFull{ID: 12, Participants: &tg.ChatParticipantsForbidden{ChatID: 12}},
+				Chats:    []tg.ChatClass{&tg.ChatForbidden{ID: 12}},
+			}, nil
+		})),
+	}
+	result := connection.CheckDestination(ctx, &tg.InputPeerChat{ChatID: 12}, content.Text)
+	if result.State != DestinationAdminLost {
+		t.Fatalf("completed loss was discarded after cancellation: %+v", result)
 	}
 }

@@ -406,3 +406,67 @@ func TestCommitWaitsForCurrentPrimarySession(t *testing.T) {
 		})
 	}
 }
+
+type blockingSessionStore struct {
+	session.StorageMemory
+	entered chan struct{}
+	release chan struct{}
+	err     error
+}
+
+func (s *blockingSessionStore) StoreSession(ctx context.Context, data []byte) error {
+	close(s.entered)
+	<-s.release
+	if s.err != nil {
+		return s.err
+	}
+	return s.StorageMemory.StoreSession(ctx, data)
+}
+
+func TestSessionHealthDoesNotWaitForPersistence(t *testing.T) {
+	for _, writeErr := range []error{nil, keychain.ErrDenied} {
+		name := "successful write"
+		if writeErr != nil {
+			name = "failed write"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			store := &blockingSessionStore{entered: make(chan struct{}), release: make(chan struct{}), err: writeErr}
+			var releaseOnce sync.Once
+			release := func() { releaseOnce.Do(func() { close(store.release) }) }
+			defer release()
+			saved := &stagedSession{store: store, dc: 2}
+			if saved.healthy() {
+				t.Fatal("uncommitted session reported ready")
+			}
+			if err := saved.commit(ctx, nil, 2); err != nil || !saved.healthy() {
+				t.Fatalf("authorized durable session was unavailable: %v", err)
+			}
+			stored := make(chan error, 1)
+			go func() { stored <- saved.StoreSession(ctx, []byte("updated session")) }()
+			select {
+			case <-store.entered:
+			case <-ctx.Done():
+				t.Fatal("session storage did not start")
+			}
+			status := make(chan bool, 1)
+			go func() { status <- saved.healthy() }()
+			select {
+			case healthy := <-status:
+				if healthy {
+					t.Fatal("session reported ready during persistence")
+				}
+			case <-ctx.Done():
+				t.Fatal("session readiness waited for persistence")
+			}
+			release()
+			if err := <-stored; !errors.Is(err, writeErr) {
+				t.Fatalf("session storage returned %v, want %v", err, writeErr)
+			}
+			if got := saved.healthy(); got != (writeErr == nil) {
+				t.Fatalf("session readiness after persistence = %v, storage error = %v", got, writeErr)
+			}
+		})
+	}
+}

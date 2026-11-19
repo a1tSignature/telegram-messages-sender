@@ -21,6 +21,7 @@ type Snapshot struct {
 	AccountID     domain.AccountID
 	Publications  []domain.Publication
 	DisabledChats []domain.ChatID
+	Paused        map[domain.PublicationID]app.StatusReason
 }
 
 func (s *Store) BindAccount(ctx context.Context, id domain.AccountID) (int64, error) {
@@ -40,7 +41,8 @@ func (s *Store) SavePublication(ctx context.Context, expectedRevision int64, pub
 		result, err := tx.ExecContext(ctx, `
 			INSERT INTO publications (id, state, interval_ns)
 			SELECT ?, ?, ? FROM configuration WHERE revision = ?
-			ON CONFLICT (id) DO UPDATE SET state = excluded.state, interval_ns = excluded.interval_ns`,
+			ON CONFLICT (id) DO UPDATE SET state = excluded.state, interval_ns = excluded.interval_ns,
+			pause_reason = CASE WHEN excluded.state = 'enabled' THEN '' ELSE publications.pause_reason END`,
 			publication.ID, publication.State, int64(publication.Interval), expectedRevision)
 		if err != nil {
 			return err
@@ -85,7 +87,7 @@ func (s *Store) SavePublication(ctx context.Context, expectedRevision int64, pub
 }
 
 func (s *Store) SetPublicationState(ctx context.Context, id domain.PublicationID, state domain.PublicationState) (int64, error) {
-	return s.updatePublication(ctx, "UPDATE publications SET state = ? WHERE id = ?", state, id)
+	return s.updatePublication(ctx, "UPDATE publications SET state = ?, pause_reason = '' WHERE id = ?", state, id)
 }
 
 func (s *Store) SetInterval(ctx context.Context, id domain.PublicationID, interval time.Duration) (int64, error) {
@@ -162,7 +164,10 @@ func (s *Store) Status(ctx context.Context) (app.Result, error) {
 	for _, publication := range state.Publications {
 		var reason app.StatusReason
 		if publication.State == domain.Stopped {
-			reason = app.ReasonManualStop
+			reason = state.Paused[publication.ID]
+			if reason == "" {
+				reason = app.ReasonManualStop
+			}
 		}
 		result.Publications = append(result.Publications, app.PublicationStatus{
 			ID:           publication.ID,
@@ -190,10 +195,17 @@ func (s *Store) readSnapshot(ctx context.Context, includeVariants bool) (Snapsho
 	}
 
 	indices := make(map[domain.PublicationID]int)
-	err = scanRows(ctx, tx, "SELECT id, state, interval_ns FROM publications ORDER BY id", func(rows *sql.Rows) error {
+	err = scanRows(ctx, tx, "SELECT id, state, interval_ns, pause_reason FROM publications ORDER BY id", func(rows *sql.Rows) error {
 		var publication domain.Publication
-		if err := rows.Scan(&publication.ID, &publication.State, &publication.Interval); err != nil {
+		var reason app.StatusReason
+		if err := rows.Scan(&publication.ID, &publication.State, &publication.Interval, &reason); err != nil {
 			return err
+		}
+		if reason != "" {
+			if state.Paused == nil {
+				state.Paused = make(map[domain.PublicationID]app.StatusReason)
+			}
+			state.Paused[publication.ID] = reason
 		}
 		indices[publication.ID] = len(state.Publications)
 		state.Publications = append(state.Publications, publication)
