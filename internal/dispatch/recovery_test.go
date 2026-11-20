@@ -313,7 +313,7 @@ func (f *drainResponse) PrepareSend(context.Context, domain.ChatID, content.Prep
 		case <-ctx.Done():
 		}
 		return telegram.SendResult{Outcome: domain.AttemptUnknown}
-	}, telegram.DestinationCheck{State: telegram.DestinationVerified}
+	}, telegram.DestinationCheck{State: telegram.DestinationVerified, Role: telegram.DestinationAdmin}
 }
 
 func TestShutdownDrainsAnAlreadySubmittedResponse(t *testing.T) {

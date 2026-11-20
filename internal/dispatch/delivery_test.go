@@ -34,18 +34,18 @@ func (f *controlledTelegram) ResolveSaved(_ context.Context, ref domain.SavedMes
 	return f.resolve(ref)
 }
 
-func (f *controlledTelegram) VerifyDestination(_ context.Context, chat domain.ChatID, _ content.Kind) telegram.DestinationCheck {
+func (f *controlledTelegram) VerifyDestinationMembership(_ context.Context, chat domain.ChatID) telegram.DestinationCheck {
 	if f.check != nil {
 		return f.check(chat)
 	}
-	return telegram.DestinationCheck{State: telegram.DestinationVerified}
+	return telegram.DestinationCheck{State: telegram.DestinationVerified, Role: telegram.DestinationAdmin}
 }
 
 func (f *controlledTelegram) PrepareSend(ctx context.Context, chat domain.ChatID, variant content.PreparedVariant) (telegram.PreparedSend, telegram.DestinationCheck) {
 	if f.prepare != nil {
 		f.prepare(chat, variant)
 	}
-	check := f.VerifyDestination(ctx, chat, variant.Kind)
+	check := f.VerifyDestinationMembership(ctx, chat)
 	return func(ctx context.Context, randomID int64, handoff telegram.SendHandoff) telegram.SendResult {
 		if handoff(ctx, func(context.Context) error { return nil }) != nil {
 			return telegram.SendResult{}
@@ -302,6 +302,58 @@ func TestDeliveryCommitFailuresStopWithoutLosingPendingCorrelation(t *testing.T)
 	}
 }
 
+func TestNonAdminSendingRequiresOptIn(t *testing.T) {
+	ctx := t.Context()
+	f := newDeliveryFixture(t)
+	f.save(t, "a", firstChat)
+	sends := 0
+	transport := &controlledTelegram{
+		check: func(domain.ChatID) telegram.DestinationCheck {
+			return telegram.DestinationCheck{State: telegram.DestinationVerified, Role: telegram.DestinationMember}
+		},
+		send: func(domain.ChatID, content.PreparedVariant, int64) telegram.SendResult {
+			sends++
+			return telegram.SendResult{Outcome: domain.AttemptSuccess, ConfirmedAt: f.time, MessageID: sends}
+		},
+	}
+	f.step(t, transport)
+	status, err := f.engine.Status(ctx)
+	if err != nil || status.AllowNonAdmin || sends != 0 || len(status.Dispatch) != 1 ||
+		status.Dispatch[0].Reason != string(telegram.DestinationAdminRequired) || len(status.DisabledChats) != 0 {
+		t.Fatalf("default did not block non-admin sending: %+v, %v, sends=%d", status, err, sends)
+	}
+
+	if err := f.engine.SetAllowNonAdmin(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := store.Open(ctx, f.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	snapshot, err := reopened.Snapshot(ctx)
+	if err != nil || !snapshot.AllowNonAdmin {
+		t.Fatalf("opt-in was not persisted: %+v, %v", snapshot, err)
+	}
+	f.step(t, transport)
+	if sends != 1 {
+		t.Fatalf("opt-in did not resume dispatch: sends=%d", sends)
+	}
+
+	f.time = f.time.Add(time.Minute)
+	transport.prepare = func(domain.ChatID, content.PreparedVariant) {
+		if err := f.engine.SetAllowNonAdmin(ctx, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.step(t, transport)
+	transport.prepare = nil
+	f.step(t, transport)
+	if sends != 1 {
+		t.Fatalf("non-admin send proceeded after opt-out: sends=%d", sends)
+	}
+}
+
 func TestDestinationLossDisablesEveryPublicationAndReenableNeedsCheck(t *testing.T) {
 	f := newDeliveryFixture(t)
 	f.save(t, "a", firstChat)
@@ -311,9 +363,9 @@ func TestDestinationLossDisablesEveryPublicationAndReenableNeedsCheck(t *testing
 	transport := &controlledTelegram{
 		check: func(chat domain.ChatID) telegram.DestinationCheck {
 			if chat == firstChat {
-				return telegram.DestinationCheck{State: verification}
+				return telegram.DestinationCheck{State: verification, Role: telegram.DestinationAdmin}
 			}
-			return telegram.DestinationCheck{State: telegram.DestinationVerified}
+			return telegram.DestinationCheck{State: telegram.DestinationVerified, Role: telegram.DestinationAdmin}
 		},
 		send: func(chat domain.ChatID, _ content.PreparedVariant, _ int64) telegram.SendResult {
 			sends = append(sends, chat)
@@ -324,7 +376,7 @@ func TestDestinationLossDisablesEveryPublicationAndReenableNeedsCheck(t *testing
 	if result, _ := f.engine.Status(t.Context()); len(result.DisabledChats) != 0 || len(sends) != 0 {
 		t.Fatal("temporary failure either sent or disabled the chat")
 	}
-	verification = telegram.DestinationAdminLost
+	verification = telegram.DestinationAccessLost
 	f.step(t, transport)
 	f.time = f.time.Add(31 * time.Second)
 	f.step(t, transport)
@@ -446,9 +498,9 @@ func TestPreflightRejectionAndVariantExhaustionAreVisible(t *testing.T) {
 		check: func(domain.ChatID) telegram.DestinationCheck {
 			reads++
 			if reads > 1 {
-				return telegram.DestinationCheck{State: telegram.DestinationAdminLost}
+				return telegram.DestinationCheck{State: telegram.DestinationAccessLost}
 			}
-			return telegram.DestinationCheck{State: telegram.DestinationVerified}
+			return telegram.DestinationCheck{State: telegram.DestinationVerified, Role: telegram.DestinationAdmin}
 		},
 		send: func(domain.ChatID, content.PreparedVariant, int64) telegram.SendResult {
 			return telegram.SendResult{Outcome: domain.AttemptFailure, Reason: "telegram_rejected", CheckRights: true}
@@ -492,9 +544,9 @@ func TestConfirmedRightsLossSurvivesUnrelatedIntervalChange(t *testing.T) {
 				}); err != nil {
 					t.Fatal(err)
 				}
-				return telegram.DestinationCheck{State: telegram.DestinationAdminLost}
+				return telegram.DestinationCheck{State: telegram.DestinationAccessLost}
 			}
-			return telegram.DestinationCheck{State: telegram.DestinationVerified}
+			return telegram.DestinationCheck{State: telegram.DestinationVerified, Role: telegram.DestinationAdmin}
 		},
 		send: func(chat domain.ChatID, _ content.PreparedVariant, _ int64) telegram.SendResult {
 			if chat == firstChat {
@@ -548,7 +600,7 @@ func (f *stalledWriteTelegram) PrepareSend(context.Context, domain.ChatID, conte
 			return telegram.SendResult{Outcome: domain.AttemptUnknown, Reason: "transport_write_interrupted"}
 		}
 		return telegram.SendResult{Outcome: domain.AttemptSuccess}
-	}, telegram.DestinationCheck{State: telegram.DestinationVerified}
+	}, telegram.DestinationCheck{State: telegram.DestinationVerified, Role: telegram.DestinationAdmin}
 }
 
 func TestBlockedMTProtoWriteLeavesTimeForStop(t *testing.T) {
@@ -613,7 +665,7 @@ func TestObservedPreflightEffectsSurviveCancellation(t *testing.T) {
 			case "rights-loss":
 				transport.check = func(domain.ChatID) telegram.DestinationCheck {
 					cancel()
-					return telegram.DestinationCheck{State: telegram.DestinationAdminLost}
+					return telegram.DestinationCheck{State: telegram.DestinationAccessLost}
 				}
 			case "preflight-wait":
 				transport.check = func(domain.ChatID) telegram.DestinationCheck {

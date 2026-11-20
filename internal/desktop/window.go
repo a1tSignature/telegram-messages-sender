@@ -21,30 +21,35 @@ import (
 )
 
 type Backend struct {
-	Command      app.Handler
-	Snapshot     func(context.Context) (store.Snapshot, error)
-	Save         func(context.Context, int64, domain.Publication) (int64, error)
-	ListSaved    func(context.Context, int, int) (telegram.SavedPage, error)
-	Destinations func(context.Context) ([]telegram.Destination, error)
-	SignIn       func(context.Context, telegram.SignInPrompts) error
-	Credentials  func(context.Context, int, string) error
+	Command          app.Handler
+	SetAllowNonAdmin func(context.Context, bool) error
+	Snapshot         func(context.Context) (store.Snapshot, error)
+	Save             func(context.Context, int64, domain.Publication) (int64, error)
+	ListSaved        func(context.Context, int, int) (telegram.SavedPage, error)
+	Destinations     func(context.Context) ([]telegram.Destination, error)
+	SignIn           func(context.Context, telegram.SignInPrompts) error
+	SignOut          func(ctx context.Context, localOnly bool) error
+	Credentials      func(context.Context, int, string) error
 }
 
 type Window struct {
 	fyne.Window
-	ctx       context.Context
-	api       Backend
-	selection *widget.Select
-	start     *widget.Button
-	stop      *widget.Button
-	interval  *widget.Button
-	edit      *widget.Button
-	details   *widget.Label
-	session   *widget.Label
-	notice    *widget.Label
-	chats     *fyne.Container
-	state     app.Result
-	loading   bool
+	ctx           context.Context
+	api           Backend
+	selection     *widget.Select
+	start         *widget.Button
+	stop          *widget.Button
+	interval      *widget.Button
+	edit          *widget.Button
+	signInButton  *widget.Button
+	signOutButton *widget.Button
+	allowNonAdmin *widget.Check
+	details       *widget.Label
+	session       *widget.Label
+	notice        *widget.Label
+	chats         *fyne.Container
+	state         app.Result
+	loading       bool
 }
 
 func NewWindow(ctx context.Context, application fyne.App, backend Backend, shutdown func()) *Window {
@@ -76,16 +81,26 @@ func NewWindow(ctx context.Context, application fyne.App, backend Backend, shutd
 	view.notice.Wrapping = fyne.TextWrapWord
 	view.notice.Hide()
 	view.chats = container.NewVBox()
+	view.allowNonAdmin = widget.NewCheck("Allow sending without administrator rights", view.changeAllowNonAdmin)
+	if backend.SetAllowNonAdmin == nil {
+		view.allowNonAdmin.Disable()
+	}
+	view.signInButton = widget.NewButton("Sign in", view.signIn)
+	view.signOutButton = widget.NewButton("Sign out", view.signOut)
+	if backend.SignOut == nil {
+		view.signOutButton.Disable()
+	}
 
 	header := widget.NewLabelWithStyle("Publications", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 	actionBar := container.NewHBox(
 		widget.NewButtonWithIcon("New publication", theme.ContentAddIcon(), func() { view.editPublication("") }),
 		widget.NewButtonWithIcon("Refresh", theme.ViewRefreshIcon(), view.Refresh),
-		widget.NewButton("Sign in", view.signIn),
+		view.signInButton,
+		view.signOutButton,
 		widget.NewButton("API credentials", view.credentials),
 	)
 	publicationBar := container.NewHBox(view.start, view.stop, view.interval, view.edit)
-	content := container.NewVBox(header, view.session, view.notice, actionBar, widget.NewSeparator(), view.selection, publicationBar, view.details, view.chats)
+	content := container.NewVBox(header, view.session, view.notice, actionBar, view.allowNonAdmin, widget.NewSeparator(), view.selection, publicationBar, view.details, view.chats)
 	view.SetContent(container.NewPadded(container.NewVScroll(content)))
 	view.Resize(fyne.NewSize(780, 560))
 	view.showSelection()
@@ -132,28 +147,61 @@ func (w *Window) Refresh() {
 }
 
 func (w *Window) render(state app.Result) {
+	chatsChanged := !slices.Equal(w.state.DisabledChats, state.DisabledChats)
 	w.state = state
-	w.session.SetText(sessionText(state.Session))
+	if !w.allowNonAdmin.Disabled() {
+		w.allowNonAdmin.SetChecked(state.AllowNonAdmin)
+	}
+	setLabelText(w.session, sessionText(state.Session))
 	w.showNotice(state.DispatchError)
 	options := make([]string, 0, len(state.Publications))
 	for _, item := range state.Publications {
 		options = append(options, string(item.ID))
 	}
-	w.selection.SetOptions(options)
+	if !slices.Equal(w.selection.Options, options) {
+		w.selection.SetOptions(options)
+	}
 	if !slices.Contains(options, w.selection.Selected) {
-		w.selection.ClearSelected()
 		if len(options) != 0 {
 			w.selection.SetSelected(options[0])
+		} else if w.selection.Selected != "" {
+			w.selection.ClearSelected()
 		}
 	}
-	w.chats.RemoveAll()
-	for _, disabled := range state.DisabledChats {
-		id := disabled.ID
-		w.chats.Add(container.NewBorder(nil, nil, nil, widget.NewButton("Re-enable", func() {
-			w.command(app.Command{Operation: app.ReenableChat, ChatID: id})
-		}), widget.NewLabel(fmt.Sprintf("%s · administrator rights lost", id))))
+	if chatsChanged {
+		rows := make([]fyne.CanvasObject, 0, len(state.DisabledChats))
+		for _, disabled := range state.DisabledChats {
+			id := disabled.ID
+			rows = append(rows, container.NewBorder(nil, nil, nil, widget.NewButton("Re-enable", func() {
+				w.command(app.Command{Operation: app.ReenableChat, ChatID: id})
+			}), widget.NewLabel(fmt.Sprintf("%s · chat disabled", id))))
+		}
+		w.chats.Objects = rows
+		w.chats.Refresh()
 	}
 	w.showSelection()
+}
+
+func (w *Window) changeAllowNonAdmin(allow bool) {
+	if w.allowNonAdmin.Disabled() || allow == w.state.AllowNonAdmin {
+		return
+	}
+	w.allowNonAdmin.Disable()
+	w.task(func(ctx context.Context) error {
+		err := w.api.SetAllowNonAdmin(ctx, allow)
+		fyne.Do(func() {
+			if w.ctx.Err() != nil {
+				return
+			}
+			if err == nil {
+				w.state.AllowNonAdmin = allow
+			}
+			w.allowNonAdmin.SetChecked(w.state.AllowNonAdmin)
+			w.allowNonAdmin.Enable()
+			w.Refresh()
+		})
+		return err
+	}, nil)
 }
 
 func sessionText(session *app.SessionStatus) string {
@@ -171,7 +219,7 @@ func sessionText(session *app.SessionStatus) string {
 }
 
 func (w *Window) showNotice(message string) {
-	w.notice.SetText(message)
+	setLabelText(w.notice, message)
 	if message == "" {
 		w.notice.Hide()
 	} else {
@@ -218,7 +266,13 @@ func (w *Window) showSelection() {
 		}
 		lines = append(lines, label)
 	}
-	w.details.SetText(strings.Join(lines, "\n"))
+	setLabelText(w.details, strings.Join(lines, "\n"))
+}
+
+func setLabelText(label *widget.Label, text string) {
+	if label.Text != text {
+		label.SetText(text)
+	}
 }
 
 func statusText(state, reason string) string {
@@ -229,6 +283,8 @@ func statusText(state, reason string) string {
 		return "Paused · no available variants"
 	case "check_unavailable":
 		return "Destination verification unavailable"
+	case "admin_required":
+		return "Administrator or owner rights required"
 	case "source_unavailable":
 		return "Saved Messages source unavailable"
 	case "publishing_restricted":

@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/gotd/td/telegram/query/dialogs"
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 
 	"telegram-messages-sender/internal/domain"
 )
@@ -18,9 +20,10 @@ type Destination struct {
 }
 
 func (c *Connection) Destinations(ctx context.Context) ([]Destination, error) {
-	if !c.Status().TransportAvailable {
+	if c.ctx.Err() != nil {
 		return nil, ErrTransport
 	}
+	// gotd can wait for a reconnect within the caller's deadline for this read.
 	var result []Destination
 	iter := dialogs.NewQueryBuilder(c.api).GetDialogs().BatchSize(100).Iter()
 	seen := make(map[domain.ChatID]bool)
@@ -46,6 +49,9 @@ func (c *Connection) Destinations(ctx context.Context) ([]Destination, error) {
 		}
 	}
 	if err := iter.Err(); err != nil {
+		if wait, ok := tgerr.AsFloodWait(err); ok && ctx.Err() == nil {
+			return nil, fmt.Errorf("Telegram rate limit reached. Try loading groups again in %d seconds", wait/time.Second)
+		}
 		return nil, connectionError(ctx, err)
 	}
 	slices.SortFunc(result, func(a, b Destination) int {

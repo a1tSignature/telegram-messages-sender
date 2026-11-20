@@ -28,10 +28,15 @@ The script builds both arm64 executables with CGO, verifies their Mach-O deploym
 
 The authorization session carries the authority of your personal Telegram account. Treat the Keychain items and API hash as secrets. If you lose control of the session, revoke it from Telegram's **Devices** settings and sign in again. SQLite stores publication settings and delivery history in `~/Library/Application Support/telegram-messages-sender/`. The API credentials and session are stored in macOS Keychain.
 
+To switch accounts, choose **Sign out** and confirm **Sign out and delete data**. This revokes the app's Telegram session and permanently deletes local publications, delivery history, and the account binding. The app keeps the API credentials for the next sign-in.
+
+If Telegram cannot confirm sign-out, choose **Delete local data** to clear the session and account data on this Mac. If the app session is still active in Telegram's **Devices** settings, end it there.
+
 ## Publications and controls
 
 - Use manual text or select a Saved Messages entry containing text, one photo or one video. The app fetches the current source before each new send. Saved Messages forwarding requests omit attribution and retain captions. Live rendering of attribution, captions and formatting is pending.
-- Select basic groups or non-forum supergroups where you are an administrator or owner and can publish under your personal profile. Broadcast channels, forum topics, anonymous administrator identities, albums and standalone file attachments are outside the supported scope.
+- Select basic groups or non-forum supergroups where you are a member and Telegram lets you publish under your personal profile. Broadcast channels, forum topics, anonymous administrator identities, albums and standalone file attachments are outside the supported scope.
+- By default, the connected account must be a group administrator or owner. Enable **Allow sending without administrator rights** to let the account publish as a regular member wherever Telegram grants it permission. This setting applies to all publications.
 - Repeats are scheduled per publication and chat from confirmed delivery. A new cycle starts with the first destination, then schedules the remaining destinations at independent offsets from that same start. Work missed during an outage is coalesced. Closing the last window stops dispatch and allows a bounded wait for an in-flight attempt.
 
 ```sh

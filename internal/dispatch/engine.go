@@ -13,6 +13,7 @@ import (
 	"telegram-messages-sender/internal/app"
 	"telegram-messages-sender/internal/domain"
 	"telegram-messages-sender/internal/store"
+	"telegram-messages-sender/internal/telegram"
 )
 
 type Engine struct {
@@ -105,7 +106,7 @@ func (e *Engine) step(ctx context.Context, transport Transport) (time.Time, bool
 	work := *item
 	e.gate.Unlock()
 
-	return time.Time{}, true, e.deliver(ctx, transport, snapshot.Revision, work)
+	return time.Time{}, true, e.deliver(ctx, transport, snapshot.Revision, snapshot.AllowNonAdmin, work)
 }
 
 func (e *Engine) refresh(ctx context.Context) (store.Snapshot, store.DeliveryState, error) {
@@ -124,6 +125,19 @@ func (e *Engine) SetUnavailable(err error) {
 	e.gate.Lock()
 	defer e.gate.Unlock()
 	e.dispatchError = err.Error()
+}
+
+func (e *Engine) ResetAccount(ctx context.Context) error {
+	e.gate.Lock()
+	defer e.gate.Unlock()
+	if err := e.state.ResetAccount(ctx); err != nil {
+		return err
+	}
+	clear(e.queue)
+	e.recoveredWake = 0
+	e.recoveredOutage = 0
+	e.dispatchError = ""
+	return nil
 }
 
 func (e *Engine) Handler() app.Handler {
@@ -190,6 +204,23 @@ func (e *Engine) SetInterval(ctx context.Context, id domain.PublicationID, inter
 		e.changed()
 	}
 	return revision, err
+}
+
+func (e *Engine) SetAllowNonAdmin(ctx context.Context, allow bool) error {
+	e.gate.Lock()
+	defer e.gate.Unlock()
+	if _, err := e.state.SetAllowNonAdmin(ctx, allow); err != nil {
+		return err
+	}
+	for _, item := range e.queue {
+		if item.blockedReason == string(telegram.DestinationAdminRequired) {
+			item.blockedReason = ""
+			item.retryAt = time.Time{}
+			item.failures = 0
+		}
+	}
+	e.changed()
+	return nil
 }
 
 func (e *Engine) SavePublication(ctx context.Context, expectedRevision int64, publication domain.Publication) (int64, error) {

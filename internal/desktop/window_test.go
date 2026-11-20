@@ -167,6 +167,35 @@ func TestClosingWindowCancelsQRSignInAtPasswordPrompt(t *testing.T) {
 	}
 }
 
+func TestStatusRefreshKeepsUnchangedChatRowsAndUpdatesDetails(t *testing.T) {
+	application := fynetest.NewApp()
+	view := NewWindow(t.Context(), application, Backend{}, func() {})
+	state := app.Result{
+		Publications:  []app.PublicationStatus{{ID: "news", State: domain.Enabled, Interval: time.Minute}},
+		DisabledChats: []app.DisabledChatStatus{{ID: "chat:42"}},
+		Dispatch:      []app.DispatchStatus{{PublicationID: "news", ChatID: "chat:17"}},
+	}
+	fyne.DoAndWait(func() {
+		defer view.Close()
+		view.render(state)
+		row := view.chats.Objects[0]
+		view.showNotice("temporary status error")
+		state.Dispatch[0].Outcome = domain.AttemptUnknown
+		view.render(state)
+		if view.chats.Objects[0] != row {
+			t.Error("refresh replaced the unchanged disabled chat row")
+		}
+		if !strings.Contains(view.details.Text, "Delivery unknown") || view.notice.Visible() {
+			t.Errorf("refresh left stale details or notice: %q, %q", view.details.Text, view.notice.Text)
+		}
+		state.DisabledChats = nil
+		view.render(state)
+		if len(view.chats.Objects) != 0 {
+			t.Error("refresh did not remove the re-enabled chat row")
+		}
+	})
+}
+
 type desktopAccountTransport struct{ online atomic.Bool }
 
 func (f *desktopAccountTransport) Status() telegram.Status {
@@ -181,7 +210,7 @@ func (*desktopAccountTransport) ResolveSaved(context.Context, domain.SavedMessag
 	return "", content.ErrSourceUnavailable
 }
 
-func (*desktopAccountTransport) VerifyDestination(context.Context, domain.ChatID, content.Kind) telegram.DestinationCheck {
+func (*desktopAccountTransport) VerifyDestinationMembership(context.Context, domain.ChatID) telegram.DestinationCheck {
 	return telegram.DestinationCheck{State: telegram.DestinationCheckUnavailable}
 }
 

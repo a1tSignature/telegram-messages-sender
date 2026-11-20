@@ -33,7 +33,7 @@ func TestDeliveryMigrationPreservesVersionOneConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.AccountID != 42 || snapshot.Revision != 5 || len(snapshot.Publications) != 1 ||
+	if snapshot.AccountID != 42 || snapshot.Revision != 5 || snapshot.AllowNonAdmin || len(snapshot.Publications) != 1 ||
 		len(snapshot.DisabledChats) != 1 || snapshot.DisabledChats[0] != "group:13" {
 		t.Fatalf("migration changed existing configuration: %+v", snapshot)
 	}

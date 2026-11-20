@@ -19,6 +19,7 @@ var (
 type Snapshot struct {
 	Revision      int64
 	AccountID     domain.AccountID
+	AllowNonAdmin bool
 	Publications  []domain.Publication
 	DisabledChats []domain.ChatID
 	Paused        map[domain.PublicationID]app.StatusReason
@@ -39,6 +40,31 @@ func (s *Store) BindAccount(ctx context.Context, id domain.AccountID) (int64, er
 			return err
 		}
 		return requireUpdated(result, ErrAccountMismatch)
+	})
+}
+
+func (s *Store) ResetAccount(ctx context.Context) error {
+	_, err := s.change(ctx, func(tx *sql.Tx) error {
+		for _, query := range []string{
+			"DELETE FROM publications",
+			"DELETE FROM disabled_chats",
+			"DELETE FROM delivery_waits",
+			"DELETE FROM update_checkpoint",
+			"UPDATE configuration SET account_id = NULL, allow_non_admin = 0",
+		} {
+			if _, err := tx.ExecContext(ctx, query); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return err
+}
+
+func (s *Store) SetAllowNonAdmin(ctx context.Context, allow bool) (int64, error) {
+	return s.change(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, "UPDATE configuration SET allow_non_admin = ?", allow)
+		return err
 	})
 }
 
@@ -161,7 +187,7 @@ func (s *Store) Status(ctx context.Context) (app.Result, error) {
 	if err != nil {
 		return app.Result{}, err
 	}
-	result := app.Result{Revision: state.Revision}
+	result := app.Result{Revision: state.Revision, AllowNonAdmin: state.AllowNonAdmin}
 	for _, id := range state.DisabledChats {
 		result.DisabledChats = append(result.DisabledChats, app.DisabledChatStatus{
 			ID: id, Reason: app.ReasonChatDisabled,
@@ -194,8 +220,8 @@ func (s *Store) readSnapshot(ctx context.Context, includeVariants bool) (Snapsho
 	defer tx.Rollback()
 
 	var state Snapshot
-	err = tx.QueryRowContext(ctx, "SELECT revision, coalesce(account_id, 0) FROM configuration").
-		Scan(&state.Revision, &state.AccountID)
+	err = tx.QueryRowContext(ctx, "SELECT revision, coalesce(account_id, 0), allow_non_admin FROM configuration").
+		Scan(&state.Revision, &state.AccountID, &state.AllowNonAdmin)
 	if err != nil {
 		return Snapshot{}, err
 	}

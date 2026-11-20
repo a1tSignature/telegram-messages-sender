@@ -22,6 +22,13 @@ static OSStatus load(CFStringRef service, CFStringRef account, CFDataRef *data) 
 	return status;
 }
 
+static OSStatus removeItem(CFStringRef service, CFStringRef account) {
+	CFMutableDictionaryRef item = query(service, account);
+	OSStatus status = SecItemDelete(item);
+	CFRelease(item);
+	return status;
+}
+
 static OSStatus save(CFStringRef service, CFStringRef account, const UInt8 *bytes, CFIndex length) {
 	CFMutableDictionaryRef item = query(service, account);
 	CFDataRef data = CFDataCreate(NULL, bytes, length);
@@ -83,6 +90,21 @@ func (s Store) LoadSession(ctx context.Context) ([]byte, error) {
 
 func (s Store) StoreSession(ctx context.Context, data []byte) error {
 	return s.save(ctx, sessionEntry, data)
+}
+
+func (s Store) DeleteSession(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	service, account := s.names(sessionEntry)
+	defer C.CFRelease(C.CFTypeRef(service))
+	defer C.CFRelease(C.CFTypeRef(account))
+
+	err := keychainError(C.removeItem(service, account))
+	if errors.Is(err, ErrMissing) {
+		return nil
+	}
+	return err
 }
 
 type appCredentials struct {

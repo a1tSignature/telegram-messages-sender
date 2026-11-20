@@ -22,10 +22,10 @@ const submissionHandoffTimeout = 2 * time.Second
 type Transport interface {
 	content.Source
 	PrepareSend(context.Context, domain.ChatID, content.PreparedVariant) (telegram.PreparedSend, telegram.DestinationCheck)
-	VerifyDestination(context.Context, domain.ChatID, content.Kind) telegram.DestinationCheck
+	VerifyDestinationMembership(context.Context, domain.ChatID) telegram.DestinationCheck
 }
 
-func (e *Engine) deliver(ctx context.Context, transport Transport, revision int64, work occurrence) error {
+func (e *Engine) deliver(ctx context.Context, transport Transport, revision int64, allowNonAdmin bool, work occurrence) error {
 	prepareCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	prepared, err := content.NewSelector(transport).Prepare(prepareCtx, work.publication.Variants, work.history.ConfirmedVariant)
@@ -35,6 +35,10 @@ func (e *Engine) deliver(ctx context.Context, transport Transport, revision int6
 
 	variant := prepared.Variant
 	send, check := transport.PrepareSend(prepareCtx, work.pair.ChatID, variant)
+	if !allowNonAdmin && !check.HasAdminRole() &&
+		(check.Role == telegram.DestinationMember || check.State == telegram.DestinationVerified) {
+		check.State = telegram.DestinationAdminRequired
+	}
 	if check.State != telegram.DestinationVerified || send == nil {
 		return e.handlePreflight(ctx, work.pair, check)
 	}
@@ -105,9 +109,9 @@ func (e *Engine) deliver(ctx context.Context, transport Transport, revision int6
 	}
 	if result.CheckRights && ctx.Err() == nil {
 		checkCtx, cancelCheck := context.WithTimeout(ctx, 5*time.Second)
-		check := transport.VerifyDestination(checkCtx, work.pair.ChatID, variant.Kind)
+		check := transport.VerifyDestinationMembership(checkCtx, work.pair.ChatID)
 		cancelCheck()
-		outcome.DisableChat = check.State == telegram.DestinationAdminLost
+		outcome.DisableChat = check.State == telegram.DestinationAccessLost
 		if check.Wait != nil {
 			outcome.WaitUntil = e.now().Add(check.Wait.Duration)
 			outcome.WaitChat = waitDestination(work.pair.ChatID, check.Wait)
@@ -172,7 +176,7 @@ func (e *Engine) handlePreflight(ctx context.Context, pair store.Pair, check tel
 	if check.Wait != nil {
 		return e.persistWait(ctx, pair.ChatID, check.Wait)
 	}
-	if check.State == telegram.DestinationAdminLost {
+	if check.State == telegram.DestinationAccessLost {
 		commitCtx, cancelCommit := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancelCommit()
 		if _, err := e.state.SetChatDisabled(commitCtx, pair.ChatID, true); err != nil {
@@ -228,19 +232,33 @@ func (e *Engine) reenable(ctx context.Context, chat domain.ChatID) (app.Result, 
 	if err != nil {
 		return app.Result{}, err
 	}
-	if transport == nil || !slices.Contains(snapshot.DisabledChats, chat) {
-		return app.Result{}, app.ErrVerificationRequired
+	if !slices.Contains(snapshot.DisabledChats, chat) {
+		return app.Result{}, fmt.Errorf("%w. Select a disabled chat", app.ErrVerificationRequired)
 	}
-	check := transport.VerifyDestination(ctx, chat, content.Text)
+	if transport == nil {
+		return app.Result{}, fmt.Errorf("%w. Connect to Telegram and try again", app.ErrVerificationRequired)
+	}
+	check := transport.VerifyDestinationMembership(ctx, chat)
 	e.gate.Lock()
 	defer e.gate.Unlock()
 	if check.Wait != nil {
 		if err := e.persistWait(ctx, chat, check.Wait); err != nil {
 			return app.Result{}, err
 		}
+		return app.Result{}, fmt.Errorf("%w. Telegram asked you to wait %s before trying again", app.ErrVerificationRequired, check.Wait.Duration)
 	}
-	if check.State != telegram.DestinationVerified || e.transport == nil {
-		return app.Result{}, app.ErrVerificationRequired
+	if err := ctx.Err(); err != nil {
+		return app.Result{}, err
+	}
+	switch {
+	case e.transport == nil, check.State == telegram.DestinationCheckUnavailable:
+		return app.Result{}, fmt.Errorf("%w. Telegram could not verify membership. Try again when connected", app.ErrVerificationRequired)
+	case check.State == telegram.DestinationAccessLost:
+		return app.Result{}, fmt.Errorf("%w. Check that the connected Telegram account has access to the group", app.ErrVerificationRequired)
+	case check.State == telegram.DestinationMigrated:
+		return app.Result{}, fmt.Errorf("%w. The group moved. Select its replacement in the publication settings", app.ErrVerificationRequired)
+	case check.State != telegram.DestinationVerified:
+		return app.Result{}, fmt.Errorf("%w. Choose a Telegram group or a non-forum supergroup", app.ErrVerificationRequired)
 	}
 	current, err := e.state.Snapshot(ctx)
 	if err != nil {
@@ -248,6 +266,9 @@ func (e *Engine) reenable(ctx context.Context, chat domain.ChatID) (app.Result, 
 	}
 	if current.Revision != snapshot.Revision {
 		return app.Result{}, store.ErrConfigurationChanged
+	}
+	if !current.AllowNonAdmin && !check.HasAdminRole() {
+		return app.Result{}, fmt.Errorf("%w. Administrator or owner rights are required when sending without administrator rights is disabled", app.ErrVerificationRequired)
 	}
 	revision, err := e.state.SetChatDisabled(ctx, chat, false)
 	if err == nil {

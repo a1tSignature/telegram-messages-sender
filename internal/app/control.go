@@ -68,6 +68,7 @@ type SessionStatus struct {
 }
 
 type Result struct {
+	AllowNonAdmin bool                 `json:"allow_non_admin,omitempty"`
 	Session       *SessionStatus       `json:"session,omitempty"`
 	Waits         []WaitStatus         `json:"waits,omitempty"`
 	Dispatch      []DispatchStatus     `json:"dispatch,omitempty"`
@@ -82,7 +83,7 @@ type Handler func(context.Context, Command) (Result, error)
 var (
 	ErrInvalidCommand       = errors.New("invalid control command")
 	ErrUnknownPublication   = errors.New("publication not found")
-	ErrVerificationRequired = errors.New("chat must be verified before re-enable")
+	ErrVerificationRequired = errors.New("Re-enabling requires confirmed Telegram group membership")
 )
 
 type Configuration interface {

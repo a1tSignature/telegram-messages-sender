@@ -50,9 +50,9 @@ type SendHandoff func(ctx context.Context, write func(context.Context) error) er
 
 type PreparedSend func(ctx context.Context, randomID int64, handoff SendHandoff) SendResult
 
-func (c *Connection) VerifyDestination(ctx context.Context, chat domain.ChatID, kind content.Kind) DestinationCheck {
+func (c *Connection) VerifyDestinationMembership(ctx context.Context, chat domain.ChatID) DestinationCheck {
 	generation := c.generation.Load()
-	_, result := c.destination(ctx, chat, kind)
+	_, result := c.destination(ctx, chat, nil)
 	if result.State == DestinationVerified && c.generation.Load() != generation {
 		return DestinationCheck{State: DestinationCheckUnavailable}
 	}
@@ -61,7 +61,7 @@ func (c *Connection) VerifyDestination(ctx context.Context, chat domain.ChatID, 
 
 func (c *Connection) PrepareSend(ctx context.Context, chat domain.ChatID, variant content.PreparedVariant) (PreparedSend, DestinationCheck) {
 	generation := c.generation.Load()
-	peer, check := c.destination(ctx, chat, variant.Kind)
+	peer, check := c.destination(ctx, chat, &variant.Kind)
 	if check.State != DestinationVerified {
 		return nil, check
 	}
@@ -83,7 +83,7 @@ func (c *Connection) PrepareSend(ctx context.Context, chat domain.ChatID, varian
 	}, check
 }
 
-func (c *Connection) destination(ctx context.Context, chat domain.ChatID, kind content.Kind) (tg.InputPeerClass, DestinationCheck) {
+func (c *Connection) destination(ctx context.Context, chat domain.ChatID, kind *content.Kind) (tg.InputPeerClass, DestinationCheck) {
 	if !c.Status().TransportAvailable {
 		return nil, DestinationCheck{State: DestinationCheckUnavailable}
 	}
@@ -91,7 +91,7 @@ func (c *Connection) destination(ctx context.Context, chat domain.ChatID, kind c
 	if peer == nil {
 		return nil, DestinationCheck{State: state, Wait: waitFromError(err)}
 	}
-	check := c.CheckDestination(ctx, peer, kind)
+	check := c.checkPeer(ctx, peer, kind)
 	if check.State == DestinationCheckUnavailable {
 		c.sendPeers.Delete(chat)
 	}

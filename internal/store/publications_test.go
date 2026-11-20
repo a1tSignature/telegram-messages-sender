@@ -106,6 +106,68 @@ func TestFailedPublicationSaveRollsBackAllChanges(t *testing.T) {
 	}
 }
 
+func TestResetAccountClearsStateAndAllowsAnotherAccount(t *testing.T) {
+	ctx := t.Context()
+	path := filepath.Join(t.TempDir(), "state.db")
+	state := openState(t, path)
+	const oldAccount, newAccount = 42, 43
+	revision, err := state.BindAccount(ctx, oldAccount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publication := domain.Publication{
+		ID: "news", State: domain.Enabled, Interval: time.Minute,
+		Destinations: []domain.ChatID{"group:12"},
+		Variants:     []domain.Variant{{ID: "saved", SavedMessage: &domain.SavedMessage{AccountID: oldAccount, MessageID: 321}}},
+	}
+	revision, err = state.SavePublication(ctx, revision, publication)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if err := state.ApplyRecovery(ctx, oldAccount, domain.UpdateCheckpoint{},
+		domain.RecoveryBatch{Checkpoint: domain.UpdateCheckpoint{PTS: 1, Date: int(now.Unix())}}, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.BeginSubmission(ctx, revision, Submission{
+		Pair:      Pair{PublicationID: publication.ID, ChatID: publication.Destinations[0]},
+		VariantID: publication.Variants[0].ID, RandomID: 17, FirstDue: now, SubmittedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.SetDeliveryWait(ctx, "", now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	revision, err = state.SetChatDisabled(ctx, publication.Destinations[0], true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := state.ResetAccount(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.Close(); err != nil {
+		t.Fatal(err)
+	}
+	state = openState(t, path)
+	snapshot, err := state.Snapshot(ctx)
+	if err != nil || snapshot.AccountID != 0 || snapshot.Revision <= revision ||
+		len(snapshot.Publications) != 0 || len(snapshot.DisabledChats) != 0 {
+		t.Fatalf("configuration after reset = %+v, %v", snapshot, err)
+	}
+	delivery, err := state.DeliveryState(ctx)
+	if err != nil || len(delivery.Pairs) != 0 || len(delivery.Waits) != 0 {
+		t.Fatalf("delivery state after reset = %+v, %v", delivery, err)
+	}
+	if _, err := state.BindAccount(ctx, newAccount); err != nil {
+		t.Fatalf("bind another account after reset: %v", err)
+	}
+	checkpoint, refs, err := state.RecoveryState(ctx, newAccount)
+	if err != nil || checkpoint != (domain.UpdateCheckpoint{}) || len(refs) != 0 {
+		t.Fatalf("recovery state after switching accounts = %+v, %v, %v", checkpoint, refs, err)
+	}
+}
+
 func TestStalePublicationEditPreservesCommittedControls(t *testing.T) {
 	ctx := t.Context()
 	state := openState(t, filepath.Join(t.TempDir(), "state.db"))

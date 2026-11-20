@@ -171,8 +171,12 @@ func (s *localSecureStore) StoreSession(ctx context.Context, data []byte) error 
 	return s.StorageMemory.StoreSession(ctx, data)
 }
 
+func (s *localSecureStore) DeleteSession(ctx context.Context) error {
+	return s.StoreSession(ctx, nil)
+}
+
 func TestDedicatedSessionOverLocalMTProto(t *testing.T) {
-	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
 	defer cancel()
 
 	network := cluster.NewCluster(cluster.Options{})
@@ -185,6 +189,20 @@ func TestDedicatedSessionOverLocalMTProto(t *testing.T) {
 	var loginAccount atomic.Int64
 	loginAccount.Store(42)
 	var logins atomic.Int32
+	var refuseLogout atomic.Bool
+	var logoutRequests atomic.Int32
+	dispatch.HandleFunc(tg.AuthLogOutRequestTypeID, func(s *tgtest.Server, req *tgtest.Request) error {
+		logoutRequests.Add(1)
+		account := accepted.Load()
+		if account == nil || account.key != [8]byte(req.Session.AuthKey.ID) {
+			return s.SendErr(req, tgerr.New(401, "AUTH_KEY_UNREGISTERED"))
+		}
+		if refuseLogout.Load() {
+			return s.SendErr(req, tgerr.New(400, "LOGOUT_FIXTURE_FAILURE"))
+		}
+		accepted.Store(nil)
+		return s.SendResult(req, &tg.AuthLoggedOut{})
+	})
 	var presentQR atomic.Bool
 	type delayedProbe struct {
 		captured chan struct{}
@@ -409,6 +427,43 @@ func TestDedicatedSessionOverLocalMTProto(t *testing.T) {
 	}
 	if err := newClient().Run(ctx, func(context.Context, *Connection) error { return nil }); err != nil {
 		t.Fatalf("did not reuse the repaired session: %v", err)
+	}
+
+	refuseLogout.Store(true)
+	if err := newClient().SignOut(ctx, false); !errors.Is(err, ErrTransport) {
+		t.Fatalf("failed Telegram sign-out returned %v", err)
+	}
+	if err := newClient().Run(ctx, func(context.Context, *Connection) error { return nil }); err != nil {
+		t.Fatalf("failed sign-out discarded the saved authorization: %v", err)
+	}
+
+	refuseLogout.Store(false)
+	storage.writeErr = keychain.ErrDenied
+	if err := newClient().SignOut(ctx, false); !errors.Is(err, keychain.ErrDenied) || accepted.Load() != nil {
+		t.Fatalf("sign-out did not report the Keychain failure after revocation: %v", err)
+	}
+	storage.writeErr = nil
+	if err := newClient().SignOut(ctx, false); err != nil {
+		t.Fatalf("retry did not remove already revoked session: %v", err)
+	}
+	if err := newClient().Run(ctx, check); !errors.Is(err, ErrSignInRequired) {
+		t.Fatalf("passive startup after sign-out returned %v", err)
+	}
+	if account, err := state.BoundAccount(ctx); err != nil || account != boundID {
+		t.Fatalf("sign-out altered the bound account: %d, %v", account, err)
+	}
+	if id, err := newClient().SignIn(ctx, prompts); err != nil || id != boundID {
+		t.Fatalf("fresh sign-in after sign-out returned account %d, %v", id, err)
+	}
+	requestsBefore := logoutRequests.Load()
+	if err := newClient().SignOut(ctx, true); err != nil {
+		t.Fatalf("local sign-out: %v", err)
+	}
+	if logoutRequests.Load() != requestsBefore || accepted.Load() == nil {
+		t.Fatal("local sign-out contacted Telegram")
+	}
+	if err := newClient().Run(ctx, check); !errors.Is(err, ErrSignInRequired) {
+		t.Fatalf("passive startup after local sign-out returned %v", err)
 	}
 }
 

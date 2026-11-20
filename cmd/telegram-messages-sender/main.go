@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -64,7 +65,9 @@ func run(ctx context.Context) error {
 	application.Lifecycle().SetOnStopped(shutdown)
 	window := desktop.NewWindow(ctx, application, desktop.Backend{
 		Command: engine.Handler(), Snapshot: state.Snapshot, Save: engine.SavePublication,
-		ListSaved: session.savedMessages, Destinations: session.destinations, SignIn: session.signIn,
+		SetAllowNonAdmin: engine.SetAllowNonAdmin,
+		ListSaved:        session.savedMessages, Destinations: session.destinations, SignIn: session.signIn,
+		SignOut:     func(ctx context.Context, localOnly bool) error { return session.signOut(ctx, engine, localOnly) },
 		Credentials: keys.StoreCredentials,
 	}, shutdown)
 	go func() {
@@ -90,6 +93,10 @@ type telegramOwner struct {
 	client    *telegram.Client
 	active    atomic.Pointer[telegram.Connection]
 	reconnect chan struct{}
+
+	mu             sync.Mutex
+	stopConnection context.CancelFunc
+	connectionDone <-chan struct{}
 }
 
 func (s *telegramOwner) run(ctx context.Context, engine *dispatch.Engine, state *store.Store) {
@@ -119,27 +126,34 @@ func (s *telegramOwner) run(ctx context.Context, engine *dispatch.Engine, state 
 }
 
 func (s *telegramOwner) connect(ctx context.Context, engine *dispatch.Engine, state *store.Store) error {
+	s.mu.Lock()
+	ctx, stopConnection := context.WithCancel(ctx)
+	connectionDone := make(chan struct{})
+	s.stopConnection, s.connectionDone = stopConnection, connectionDone
+	s.mu.Unlock()
+	defer close(connectionDone)
+	defer stopConnection()
+	if ctx.Err() != nil {
+		return nil
+	}
+
 	// Keep the Telegram connection live while the dispatcher drains an already submitted request.
 	network, disconnect := context.WithCancel(context.WithoutCancel(ctx))
-	done := make(chan struct{})
+	defer disconnect()
 	stop := context.AfterFunc(ctx, func() {
 		timer := time.NewTimer(6 * time.Second)
 		defer timer.Stop()
 		select {
-		case <-done:
+		case <-connectionDone:
 		case <-timer.C:
 			disconnect()
 		}
 	})
-	defer func() {
-		close(done)
-		stop()
-		disconnect()
-	}()
-	return s.client.Run(network, func(live context.Context, connection *telegram.Connection) error {
-		dispatchCtx, stopDispatch := context.WithCancel(live)
-		stopOnClose := context.AfterFunc(ctx, stopDispatch)
-		defer stopOnClose()
+	defer stop()
+	err := s.client.Run(network, func(live context.Context, connection *telegram.Connection) error {
+		dispatchCtx, stopDispatch := context.WithCancel(ctx)
+		stopOnDisconnect := context.AfterFunc(live, stopDispatch)
+		defer stopOnDisconnect()
 		defer stopDispatch()
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -151,17 +165,51 @@ func (s *telegramOwner) connect(ctx context.Context, engine *dispatch.Engine, st
 		defer s.active.Store(nil)
 		return engine.RunRecovering(dispatchCtx, connection)
 	})
+	if ctx.Err() != nil {
+		return nil
+	}
+	return err
 }
 
 func (s *telegramOwner) signIn(ctx context.Context, prompts telegram.SignInPrompts) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if _, err := s.client.SignIn(ctx, prompts); err != nil {
 		return err
 	}
+	s.requestReconnect()
+	return nil
+}
+
+func (s *telegramOwner) signOut(ctx context.Context, engine *dispatch.Engine, localOnly bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	defer s.requestReconnect()
+	if s.stopConnection != nil {
+		s.stopConnection()
+		select {
+		case <-s.connectionDone:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if err := s.client.SignOut(ctx, localOnly); err != nil {
+		return err
+	}
+	if err := engine.ResetAccount(ctx); err != nil {
+		return fmt.Errorf("could not delete local account data. Choose Sign out again to retry: %w", err)
+	}
+	return nil
+}
+
+func (s *telegramOwner) requestReconnect() {
 	select {
 	case s.reconnect <- struct{}{}:
 	default:
 	}
-	return nil
 }
 
 func (s *telegramOwner) savedMessages(ctx context.Context, offset, limit int) (telegram.SavedPage, error) {

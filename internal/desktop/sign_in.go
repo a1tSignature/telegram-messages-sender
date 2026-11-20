@@ -3,6 +3,7 @@ package desktop
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -96,6 +97,53 @@ func (w *Window) signIn() {
 			w.Refresh()
 		})
 	}()
+}
+
+func (w *Window) signOut() {
+	confirm := dialog.NewConfirm("Sign out of Telegram?",
+		"Signing out permanently deletes local publications, delivery history, and account settings.", func(confirmed bool) {
+			if confirmed {
+				w.performSignOut(false)
+			}
+		}, w.Window)
+	confirm.SetConfirmText("Sign out and delete data")
+	confirm.Show()
+}
+
+func (w *Window) performSignOut(localOnly bool) {
+	w.signInButton.Disable()
+	w.signOutButton.Disable()
+	go func() {
+		ctx, cancel := context.WithTimeout(w.ctx, 25*time.Second)
+		defer cancel()
+		err := w.api.SignOut(ctx, localOnly)
+		fyne.Do(func() {
+			if w.ctx.Err() != nil {
+				return
+			}
+			w.signInButton.Enable()
+			w.signOutButton.Enable()
+			w.Refresh()
+			switch {
+			case err == nil:
+			case !localOnly && (errors.Is(err, telegram.ErrTransport) || errors.Is(err, context.DeadlineExceeded)):
+				w.confirmLocalSignOut()
+			default:
+				dialog.ShowError(fmt.Errorf("could not sign out of Telegram: %w", err), w.Window)
+			}
+		})
+	}()
+}
+
+func (w *Window) confirmLocalSignOut() {
+	confirm := dialog.NewConfirm("Sign out on this Mac?",
+		"Telegram could not confirm sign-out. You can delete local data now.\nIf the session remains active, end it in Telegram Settings → Devices.", func(confirmed bool) {
+			if confirmed {
+				w.performSignOut(true)
+			}
+		}, w.Window)
+	confirm.SetConfirmText("Delete local data")
+	confirm.Show()
 }
 
 func (w *Window) credentials() {

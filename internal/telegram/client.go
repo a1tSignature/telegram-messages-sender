@@ -24,6 +24,7 @@ import (
 type SecureStore interface {
 	session.Storage
 	LoadCredentials(ctx context.Context) (id int, hash string, err error)
+	DeleteSession(context.Context) error
 }
 
 var errInvalidStoredSession = errors.New("invalid stored Telegram session")
@@ -80,6 +81,61 @@ func (c *Client) SignIn(ctx context.Context, prompts SignInPrompts) (domain.Acco
 	return c.start(ctx, &prompts, nil)
 }
 
+func (c *Client) SignOut(ctx context.Context, localOnly bool) error {
+	if !c.running.CompareAndSwap(false, true) {
+		return ErrClientBusy
+	}
+	defer c.running.Store(false)
+
+	if !localOnly {
+		if err := c.revokeSession(ctx); err != nil {
+			return err
+		}
+	}
+	if err := c.store.DeleteSession(ctx); err != nil {
+		return secretStoreError(ctx, err)
+	}
+	return nil
+}
+
+func (c *Client) revokeSession(ctx context.Context) error {
+	data, err := c.store.LoadSession(ctx)
+	if errors.Is(err, session.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return secretStoreError(ctx, err)
+	}
+	defer clear(data)
+
+	id, hash, err := c.credentials(ctx)
+	if err != nil {
+		return err
+	}
+	_, err = c.run(ctx, id, hash, data, nil, nil, true)
+	if errors.Is(err, errInvalidStoredSession) {
+		return keychain.ErrInvalid
+	}
+	if errors.Is(err, ErrSessionRevoked) {
+		return nil
+	}
+	return err
+}
+
+func (c *Client) credentials(ctx context.Context) (int, string, error) {
+	id, hash, err := c.store.LoadCredentials(ctx)
+	if errors.Is(err, keychain.ErrMissing) {
+		return 0, "", ErrCredentialsMissing
+	}
+	if err != nil {
+		return 0, "", secretStoreError(ctx, err)
+	}
+	if id <= 0 || id > math.MaxInt32 || hash == "" {
+		return 0, "", keychain.ErrInvalid
+	}
+	return id, hash, nil
+}
+
 func (c *Client) start(ctx context.Context, prompts *SignInPrompts, use func(context.Context, *Connection) error) (domain.AccountID, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
@@ -89,15 +145,9 @@ func (c *Client) start(ctx context.Context, prompts *SignInPrompts, use func(con
 	}
 	defer c.running.Store(false)
 
-	id, hash, err := c.store.LoadCredentials(ctx)
+	id, hash, err := c.credentials(ctx)
 	if err != nil {
-		if errors.Is(err, keychain.ErrMissing) {
-			return 0, ErrCredentialsMissing
-		}
-		return 0, secretStoreError(ctx, err)
-	}
-	if id <= 0 || id > math.MaxInt32 || hash == "" {
-		return 0, keychain.ErrInvalid
+		return 0, err
 	}
 
 	data, err := c.store.LoadSession(ctx)
@@ -114,7 +164,7 @@ func (c *Client) start(ctx context.Context, prompts *SignInPrompts, use func(con
 		return 0, secretStoreError(ctx, err)
 	default:
 		defer clear(data)
-		account, err := c.run(ctx, id, hash, data, nil, use)
+		account, err := c.run(ctx, id, hash, data, nil, use, false)
 		if errors.Is(err, errInvalidStoredSession) {
 			if prompts == nil {
 				return 0, secretStoreError(ctx, keychain.ErrInvalid)
@@ -124,13 +174,13 @@ func (c *Client) start(ctx context.Context, prompts *SignInPrompts, use func(con
 		}
 	}
 
-	return c.run(ctx, id, hash, nil, prompts, use)
+	return c.run(ctx, id, hash, nil, prompts, use, false)
 }
 
-func (c *Client) run(ctx context.Context, appID int, hash string, initial []byte, prompts *SignInPrompts, use func(context.Context, *Connection) error) (domain.AccountID, error) {
+func (c *Client) run(ctx context.Context, appID int, hash string, initial []byte, prompts *SignInPrompts, use func(context.Context, *Connection) error, signOut bool) (domain.AccountID, error) {
 	saved := &stagedSession{store: c.store, data: bytes.Clone(initial)}
 	defer saved.clear()
-	if len(initial) != 0 {
+	if len(initial) != 0 || signOut {
 		loader := session.Loader{Storage: saved}
 		data, err := loader.Load(ctx)
 		if err != nil {
@@ -189,6 +239,11 @@ func (c *Client) run(ctx context.Context, appID int, hash string, initial []byte
 	var callbackErr, bindingErr error
 	err := transport.Run(ctx, func(live context.Context) (err error) {
 		defer func() { callbackErr = err }()
+		if signOut {
+			// Preserve the saved key until Telegram confirms revocation.
+			_, err := transport.API().AuthLogOut(live)
+			return err
+		}
 		if prompts != nil {
 			err := runQR(live, transport.API(), appID, hash, transport.MigrateTo, nil, loggedIn, *prompts)
 			if err != nil {
