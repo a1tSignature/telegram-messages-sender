@@ -8,6 +8,8 @@
     <string>Telegram Messages Sender</string>
     <key>CFBundleExecutable</key>
     <string>telegram-messages-sender</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon.icns</string>
     <key>CFBundleIdentifier</key>
     <string>telegram-messages-sender</string>
     <key>CFBundleInfoDictionaryVersion</key>

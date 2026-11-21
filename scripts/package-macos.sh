@@ -18,7 +18,7 @@ trap 'rm -rf "$stage"' EXIT
 trap 'exit 1' HUP INT TERM
 
 bundle="$stage/$name.app"
-mkdir -p "$bundle/Contents/MacOS"
+mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
 plist="$bundle/Contents/Info.plist"
 cp packaging/macos/Info.plist "$plist"
 plutil -lint "$plist"
@@ -26,6 +26,8 @@ test "$(plutil -extract CFBundleExecutable raw "$plist")" = "$name"
 test "$(plutil -extract CFBundleIdentifier raw "$plist")" = "$name"
 test "$(plutil -extract CFBundlePackageType raw "$plist")" = APPL
 test "$(plutil -extract LSMinimumSystemVersion raw "$plist")" = "$minimum"
+icon=$(plutil -extract CFBundleIconFile raw "$plist")
+cp "packaging/macos/$icon" "$bundle/Contents/Resources/"
 
 build() {
     MACOSX_DEPLOYMENT_TARGET="$minimum" CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 \
